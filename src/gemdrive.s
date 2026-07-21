@@ -44,6 +44,14 @@ PRG_MAGIC_NUMBER        equ $601A      ; Magic number of the PRG file
 STACK_SIZE_HACK_PEXEC   equ 50         ; This is the size of the stack to hack the Pexec() function in <=1.06 TOS versions
                                        ; The size is the same as the size of the movem.l in the save_regs/restore_regs macros plus 4
 
+; Fase 1 (multi-drive, 68k-side only): the Pico must publish a drive table
+; using exactly this protocol version, or this ROM refuses to boot (no
+; silent single-drive fallback). SIDETNFS_MAX_RUNTIME_DRIVES bounds the
+; shared drive_number table below.
+GEMDOS_SLOT_PROTOCOL_VERSION equ 1     ; Protocol version this ROM requires from the Pico
+SIDETNFS_MAX_ORDINARY_DRIVES equ 8     ; Configurable TNFS/SD drives (informational -- the 68k side is backend-agnostic and never distinguishes these from the CONFIG drive)
+SIDETNFS_MAX_RUNTIME_DRIVES  equ 9     ; SIDETNFS_MAX_ORDINARY_DRIVES + 1 CONFIG drive from flash -- number of slots in the shared drive_number table
+
 ROM4_START_ADDR         equ $FA0000 ; ROM4 start address
 ROM3_START_ADDR         equ $FB0000 ; ROM3 start address
 ROM_EXCHG_BUFFER_ADDR   equ (ROM3_START_ADDR)               ; ROM4 buffer address
@@ -110,10 +118,25 @@ CMD_DTA_RELEASE_CALL    equ ($8B + APP_GEMDRVEMUL)           ; Release the DTA f
 ; Shared variables indexes
 ; The first 16 variables are reserved for the shared functions
 SHARED_VARIABLE_FIRST_FILE_DESCRIPTOR   equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 0             ; First file descriptor to use in the Sidecart
-SHARED_VARIABLE_DRIVE_LETTER            equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 1             ; Drive letter of the emulated drive
-SHARED_VARIABLE_DRIVE_NUMBER            equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 2             ; Drive number of the emulated drive
+; Indexes +1 (drive letter) and +2 (drive number) used to hold the single
+; emulated drive as two separate scalars. Retired in favour of the
+; multi-drive table below (+5..+15): the drive letter is always derived as
+; 'A' + drive_number, never stored separately.
 SHARED_VARIABLE_PEXEC_RESTORE           equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 3             ; Pexec address to restore the program
 SHARED_VARIABLE_FAKE_FLOPPY             equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 4             ; Fake floppy drive to launch AUTO programs
+
+; Fase 1 (multi-drive, 68k-side only): protocol version + active-drive
+; table, set by the Pico before this ROM installs its GEMDOS vector. Reuses
+; the free +5..+15 range of this same shared-variable block (indexes
+; 21..31 / byte offsets +84..+127 of GEMDRVEMUL_SHARED_VARIABLES below) --
+; no growth of the 256-byte shared-variable block, no backend-type field,
+; no separate drive-letter table. The table has SIDETNFS_MAX_RUNTIME_DRIVES
+; (9) entries -- up to SIDETNFS_MAX_ORDINARY_DRIVES (8) configurable TNFS/SD
+; drives plus 1 CONFIG drive from flash; the 68k side is backend-agnostic
+; and never needs to know which slot is which kind.
+SHARED_VARIABLE_PROTOCOL_VERSION        equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 5             ; Protocol version set by the Pico (must equal GEMDOS_SLOT_PROTOCOL_VERSION)
+SHARED_VARIABLE_DRIVE_COUNT             equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 6             ; Number of active entries in the drive_number table (1..SIDETNFS_MAX_RUNTIME_DRIVES)
+SHARED_VARIABLE_DRIVE_NUMBER_TABLE      equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 7             ; Base index of a SIDETNFS_MAX_RUNTIME_DRIVES-entry table of GEMDOS drive numbers (indexes +7..+15)
 
 GEMDRVEMUL_TIMEOUT_SEC  equ (ROM_EXCHG_BUFFER_ADDR + $8)     ; ROM_EXCHG_BUFFER_ADDR + 8 bytes
 GEMDRVEMUL_PING_STATUS  equ (GEMDRVEMUL_TIMEOUT_SEC + $4)    ; GEMDRVEMUL_TIMEOUT_SEC + 4 bytes
@@ -239,29 +262,36 @@ reentry_gem_unlock  macro
                     moveq.w #0,d1                        ; Payload size is 0 bytes
                     bsr send_sync_command_to_sidecart
                 	endm
-; Check if the drive is the emulated one. If not, exec_old_handler the code
-; otherwise continue with the code
+; Check if the current GEMDOS drive is one of the emulated drives. If not,
+; exec_old_handler the code, otherwise continue with the code.
+; Output: d0.w = slot index (0..SIDETNFS_MAX_RUNTIME_DRIVES-1) of the matched drive in
+; the shared drive_number table -- not yet used by any caller in this phase,
+; but every call site now receives it for later phases to consume.
 detect_emulated_drive   macro
                         reentry_gem_lock
                         gemdos Dgetdrv, 2                    ; Call Dgetdrv() and get the drive number
                         move.l d0, -(sp)                     ; Save the return value with the drive number
-                        reentry_gem_unlock              
+                        reentry_gem_unlock
                         move.l (sp)+, d0                     ; Restore the drive number
-                        cmp.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER * 4)), d0            ; Check if the drive is the emulated one
-                        bne .exec_old_handler
+                        bsr find_drive_slot_by_number         ; d0 = slot index, or -1 if not one of the emulated drives
+                        tst.w d0
+                        bmi .exec_old_handler
                         endm
 
-; Check if the first letter of the path is the emulated drive. If not, exec_old_handler the code
-; Pass the address of the file specification string in a4
+; Check if the first letter of the path is one of the emulated drives. If
+; not, exec_old_handler the code. Pass the address of the file specification
+; string in a4.
+; Output: d0.w = slot index (0..SIDETNFS_MAX_RUNTIME_DRIVES-1) of the matched drive.
 detect_emulated_drive_letter   macro
                         cmp.b #':', 1(a4)                    ; Check if the second character of the file specification string is the colon
                         bne.s .\@detect_emulated_drive_continue; If not, exec_old_handler the code. Otherwise continue with the code
                         move.b (a4), d0                      ; Get the first letter of the file specification string
-                        cmp.b (GEMDRVEMUL_SHARED_VARIABLES + 3 + (SHARED_VARIABLE_DRIVE_LETTER * 4)), d0 ; Check if the first letter is the emulated drive
-                        bne .exec_old_handler                ; If not, exec_old_handler the code. Otherwise continue with the code
-                        bra.s .\@detect_emulated_drive_ignore; The drive is the emulated one, ignoe detect the current drive
+                        bsr find_drive_slot_by_letter         ; d0 = slot index, or -1 if not one of the emulated drives
+                        tst.w d0
+                        bmi .exec_old_handler                ; If not, exec_old_handler the code. Otherwise continue with the code
+                        bra.s .\@detect_emulated_drive_ignore; The drive is one of the emulated ones, slot index already in d0
 .\@detect_emulated_drive_continue:
-                        detect_emulated_drive                ; Check if the drive is the emulated one.
+                        detect_emulated_drive                ; Check if the drive is one of the emulated ones.
 .\@detect_emulated_drive_ignore:
                         endm
 
@@ -320,9 +350,20 @@ _ping_ready:
     bsr clean_gem_reentry_lock
     print ok_msg
 
+; Validate the multi-drive table set by the Pico (protocol version, drive
+; count, drive numbers). Hard failure here means the Pico firmware does not
+; speak the protocol version this ROM requires -- no silent single-drive
+; fallback.
+    print validate_drive_table_msg
+    bsr validate_drive_table
+    tst.w d0
+    bne _exit_invalid_table
+    print ok_msg
+
 ; Show the disk drive to emulate
     print emulated_drive_msg
-    move.b (GEMDRVEMUL_SHARED_VARIABLES + 3 + (SHARED_VARIABLE_DRIVE_LETTER * 4)), d0 
+    move.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), d0   ; Get the drive number of slot 0 (the primary/default drive)
+    add.w #'A', d0                                                                             ; Convert to its drive letter
     pchar_reg
     pchar ':'
     pchar '\'
@@ -362,6 +403,10 @@ _ping_ready:
 
 _exit_timemout:
     asksil error_sidecart_comm_msg
+    rts
+
+_exit_invalid_table:
+    asksil error_invalid_table_msg
     rts
 
 ; Print the obtained TOS version
@@ -723,15 +768,147 @@ clean_gem_reentry_lock:
     moveq.w #0,d1                        ; Payload size is 0 bytes
     bra send_sync_command_to_sidecart
 
+; Set one _drvbits bit for every entry in the active-drive table, then make
+; slot 0 the current/default drive via Dsetdrv(). With
+; SHARED_VARIABLE_DRIVE_COUNT effectively pinned to 1 in this phase, this is
+; byte-for-byte equivalent to the previous single-drive behaviour.
 create_virtual_hard_disk:
-    move.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER * 4)), d0    ; Get the drive number
+    movem.l d1-d3/a5,-(sp)
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_COUNT * 4)), d2       ; d2 = number of active drives
+    lea (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), a5   ; a5 -> drive_number[0]
+    move.l _drvbits.w, d3
+.create_virtual_hard_disk_loop:
+    tst.l d2
+    beq.s .create_virtual_hard_disk_done
+    move.w 2(a5), d0                     ; d0 = drive_number[slot]
     moveq.l #1, d1
-    lsl.l d0, d1                        ; Calculate the bit number of the drive
-    move.l _drvbits.w, d0
-    add.l d1, d0    ; Set the drive bit
-    move.l d0, _drvbits.w
-    move.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER * 4)), -(sp)        ; Emulated drive in the parameter of Dsetdrv()
+    lsl.l d0, d1                         ; Calculate the bit number of the drive
+    or.l d1, d3                          ; Set the drive bit
+    addq.l #4, a5                        ; Next slot
+    subq.l #1, d2
+    bra.s .create_virtual_hard_disk_loop
+.create_virtual_hard_disk_done:
+    move.l d3, _drvbits.w
+
+    move.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), -(sp)  ; Slot 0 becomes the current/default drive
     gemdos Dsetdrv, 4                    ; Call Dsetdrv() and set the emulated drive
+    movem.l (sp)+, d1-d3/a5
+    rts
+
+; Read and validate the multi-drive table set by the Pico after PING:
+; protocol version must match exactly, drive count must be in
+; 1..SIDETNFS_MAX_RUNTIME_DRIVES, every drive number must be in 0..25 (A..Z), and no
+; drive number may appear twice.
+; Output: d0.w = 0 if valid, -1 if not (protocol version mismatch or
+; malformed table)
+; Modifies: d0 only (all other registers preserved)
+validate_drive_table:
+    movem.l d1-d4/a4-a5,-(sp)
+
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_PROTOCOL_VERSION * 4)), d0
+    cmp.l #GEMDOS_SLOT_PROTOCOL_VERSION, d0
+    bne.s .validate_drive_table_fail
+
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_COUNT * 4)), d1   ; d1 = drive count
+    cmp.l #1, d1
+    blt.s .validate_drive_table_fail
+    cmp.l #SIDETNFS_MAX_RUNTIME_DRIVES, d1
+    bgt.s .validate_drive_table_fail
+
+    ; d1 = validated drive count (1..SIDETNFS_MAX_RUNTIME_DRIVES). Check that
+    ; every entry is a plausible GEMDOS drive number (0..25 = A..Z) and that
+    ; no entry appears twice (O(n^2); n is at most SIDETNFS_MAX_RUNTIME_DRIVES = 9).
+    lea (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), a5 ; a5 -> drive_number[0]
+    move.l d1, d4                          ; d4 = outer loop counter (entries left)
+.validate_drive_table_outer:
+    tst.l d4
+    beq.s .validate_drive_table_ok
+    move.w 2(a5), d2                       ; d2 = drive_number[i]
+    cmp.w #0, d2
+    blt.s .validate_drive_table_fail
+    cmp.w #25, d2
+    bgt.s .validate_drive_table_fail
+
+    ; Compare against every later entry for a duplicate
+    lea 4(a5), a4                          ; a4 -> drive_number[i+1]
+    move.l d4, d3
+    subq.l #1, d3                          ; d3 = number of later entries to check
+.validate_drive_table_inner:
+    tst.l d3
+    beq.s .validate_drive_table_next
+    cmp.w 2(a4), d2
+    beq.s .validate_drive_table_fail       ; duplicate drive number
+    addq.l #4, a4
+    subq.l #1, d3
+    bra.s .validate_drive_table_inner
+.validate_drive_table_next:
+    addq.l #4, a5
+    subq.l #1, d4
+    bra.s .validate_drive_table_outer
+
+.validate_drive_table_ok:
+    moveq #0, d0
+    bra.s .validate_drive_table_exit
+.validate_drive_table_fail:
+    moveq #-1, d0
+.validate_drive_table_exit:
+    movem.l (sp)+, d1-d4/a4-a5
+    rts
+
+; Search the active-drive table for a given GEMDOS drive number (0-based:
+; A=0, B=1, ...). Used by detect_emulated_drive.
+; Input:  d0.w = GEMDOS drive number to look for
+; Output: d0.w = slot index (0..SIDETNFS_MAX_RUNTIME_DRIVES-1) if found, -1 if not
+; Modifies: d0 only (all other registers preserved)
+find_drive_slot_by_number:
+    movem.l d1-d2/a5,-(sp)
+    move.w d0, d2                        ; d2 = target drive number
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_COUNT * 4)), d1  ; d1 = number of active drives
+    lea (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), a5 ; a5 -> drive_number[0]
+    moveq #0, d0                         ; d0 = slot index being tested
+.find_drive_slot_by_number_loop:
+    tst.l d1
+    beq.s .find_drive_slot_by_number_notfound
+    cmp.w 2(a5), d2                      ; compare with low word of drive_number[slot]
+    beq.s .find_drive_slot_by_number_exit
+    addq.l #4, a5                        ; next slot (4 bytes per shared variable)
+    addq.w #1, d0
+    subq.l #1, d1
+    bra.s .find_drive_slot_by_number_loop
+.find_drive_slot_by_number_notfound:
+    moveq #-1, d0
+.find_drive_slot_by_number_exit:
+    movem.l (sp)+, d1-d2/a5
+    rts
+
+; Search the active-drive table for a given drive letter (uppercase ASCII),
+; derived from each slot's drive number as 'A' + drive_number[slot]. Used by
+; detect_emulated_drive_letter.
+; Input:  d0.b = drive letter to look for
+; Output: d0.w = slot index (0..SIDETNFS_MAX_RUNTIME_DRIVES-1) if found, -1 if not
+; Modifies: d0 only (all other registers preserved)
+find_drive_slot_by_letter:
+    movem.l d1-d3/a5,-(sp)
+    and.l #$FF, d0
+    move.w d0, d2                        ; d2 = target drive letter
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_COUNT * 4)), d1
+    lea (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), a5
+    moveq #0, d0
+.find_drive_slot_by_letter_loop:
+    tst.l d1
+    beq.s .find_drive_slot_by_letter_notfound
+    move.w 2(a5), d3                     ; d3 = drive_number[slot]
+    add.w #'A', d3                       ; d3 = corresponding drive letter
+    cmp.w d3, d2
+    beq.s .find_drive_slot_by_letter_exit
+    addq.l #4, a5
+    addq.w #1, d0
+    subq.l #1, d1
+    bra.s .find_drive_slot_by_letter_loop
+.find_drive_slot_by_letter_notfound:
+    moveq #-1, d0
+.find_drive_slot_by_letter_exit:
+    movem.l (sp)+, d1-d3/a5
     rts
 
 ; Get the cookie jar from d0.l as parameter
@@ -884,8 +1061,10 @@ _notlong:
 .Dfree:
     move.w 8(a0),d3                      ; get the drive number
     subq.w #1, d3                        ; Remove 1 to the drive number. I don't want to use the default drive
-    cmp.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER * 4)), d3            ; Check if the drive is the emulated one
-    bne .exec_old_handler                ; If not, exec_old_handler the code
+    move.w d3, d0                        ; d0 = drive number to search for
+    bsr find_drive_slot_by_number        ; d0 = slot index, or -1 if not one of the emulated drives
+    tst.w d0
+    bmi .exec_old_handler                ; If not, exec_old_handler the code
     move.l 10(a0),a4                     ; get the address of the structure to store the information
     send_sync CMD_DFREE_CALL, 2          ; Send the command to the Sidecart. 2 bytes of payload
 
@@ -938,8 +1117,10 @@ _notlong:
     tst.w d3                             ; Check if the drive number is 0 (current drive)
     beq.s .Dgetpath_current_drive        ; If it's the current drive, continue with the code
     subq.w #1, d3                        ; Remove 1 to the drive number. A is 0, B is 1, C is 2, etc.
-    cmp.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER * 4)), d3            ; Check if the drive is the emulated one
-    bne .exec_old_handler                ; If not, exec_old_handler the code        
+    move.w d3, d0                        ; d0 = drive number to search for
+    bsr find_drive_slot_by_number        ; d0 = slot index, or -1 if not one of the emulated drives
+    tst.w d0
+    bmi .exec_old_handler                ; If not, exec_old_handler the code
 
 .Dgetpath_current_drive:
 ;    detect_emulated_drive                ; Check if the drive is the emulated one. If not, exec_old_handler the code.
@@ -1318,8 +1499,9 @@ _notlong:
     move.b (a4), d0                      ; Get the first character of the file specification string
 .fs_first_check_drive_others:
 
-    cmp.b (GEMDRVEMUL_SHARED_VARIABLES + 3 + (SHARED_VARIABLE_DRIVE_LETTER * 4)), d0   ; Check if the first letter of the file specification string is the hard disk drive letter
-    beq.s .fs_first_emulated             ; If so, execute specific fsfirst emulated code
+    bsr find_drive_slot_by_letter        ; d0 = slot index, or -1 if not one of the emulated drives
+    tst.w d0
+    bpl.s .fs_first_emulated             ; If found, execute specific fsfirst emulated code
     bra .exec_old_handler              ; Now it's safe to execute the old handler
 ; We need to clean the DTA to avoid issues with previous DTAs used in the emulated code
 ;    reentry_gem_lock
@@ -1745,6 +1927,9 @@ rtc_already_started_msg:
 set_datetime_msg:
         dc.b	"[..] Date and time: ",0
 
+validate_drive_table_msg:
+        dc.b	"[..] Checking drive table...",0
+
 emulated_drive_msg:
         dc.b	"[..] Emulating drive ",0
 
@@ -1753,6 +1938,9 @@ ready_gemdrive_msg:
 
 error_sidecart_comm_msg:
         dc.b	$d,$a,"Error communication. Power cycle the computer.",$d,$a,0
+
+error_invalid_table_msg:
+        dc.b	$d,$a,"Error: invalid drive table or protocol version. Update the Sidecart firmware.",$d,$a,0
 
 backwards_msg:
         dc.b    $8, $8,0
