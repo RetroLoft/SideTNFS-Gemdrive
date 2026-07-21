@@ -311,7 +311,24 @@ detect_emulated_file_handler   macro
         org $FA0040
     endif
 rom_function:
-    print gemdrive_emulator_msg
+    print gemdrive_emulator_msg          ; Prints "...GEMDRIVE - v" and stops there (see note above)
+
+; Print the ROM version digits at runtime (VERSION_MAJOR/MINOR/PATCH are
+; numeric -D defines, single decimal digits 0-9; convert to ASCII here
+; rather than embedding them as static bytes -- see the note above
+; gemdrive_emulator_msg for why that silently truncated the boot banner).
+    moveq #VERSION_MAJOR, d0
+    add.b #'0', d0
+    pchar_reg
+    pchar '.'
+    moveq #VERSION_MINOR, d0
+    add.b #'0', d0
+    pchar_reg
+    pchar '.'
+    moveq #VERSION_PATCH, d0
+    add.b #'0', d0
+    pchar_reg
+    print spacing
 
 ; Setup the RTC
     tst.l GEMDRVEMUL_RTC_ENABLED
@@ -1103,11 +1120,13 @@ _notlong:
 .Dsetpath:
     move.l 8(a0),a4                      ; Address to the new GEMDOS path
 
-    detect_emulated_drive 0              ; Check if the drive is the emulated one. If not, exec_old_handler the code. 
-                                         ; Otherwise continue with the code
+    detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code.
+                                         ; d0.w = slot index of the matched drive: the explicit "X:" prefix in the
+                                         ; path if present, otherwise the current GEMDOS drive (via Dgetdrv())
 
     ; This is the emulated drive, it's our moment!
-    send_write_sync CMD_DSETPATH_CALL, 256    
+    move.w d0, d3                        ; d3.w = slot index, sent as the first word of the CMD_DSETPATH_CALL payload
+    send_write_sync CMD_DSETPATH_CALL, 256
 
     return_interrupt_w GEMDRVEMUL_SET_DPATH_STATUS ; Return the error code from the Sidecart
 
@@ -1880,22 +1899,22 @@ _notlong:
 
 
         even
+; NOTE: VERSION_MAJOR/MINOR/PATCH are numeric -D defines (single decimal
+; digits, e.g. 1/0/1), not string literals -- vasm's -D only defines a
+; numeric symbol, so "dc.b VERSION_MAJOR" would emit the raw byte value
+; (e.g. 0x01, and 0x00 for a "0" component), not the printable ASCII digit.
+; A literal 0x00 byte terminates Cconws early, silently swallowing the rest
+; of this string (including its trailing blank-line CRLFs) and everything
+; printed after this point lands on the same screen line. The version
+; digits are therefore printed at runtime instead (see rom_function below);
+; this string stops right after "v" on purpose.
 gemdrive_emulator_msg:
         dc.b	"SidecarTridge multidevice"
         dc.b    $d,$a,$a
-        dc.b    "GEMDRIVE - "
-        
-version:
-        dc.b    "v"
-        dc.b    VERSION_MAJOR
-        dc.b    "."
-        dc.b    VERSION_MINOR
-        dc.b    "."
-        dc.b    VERSION_PATCH
-        dc.b    $d,$a
+        dc.b    "GEMDRIVE - v",0
 
 spacing:
-        dc.b    $d,$a,0
+        dc.b    $d,$a,$d,$a,0
 
 set_version_msg:
         dc.b	"[..] TOS version: ",0
