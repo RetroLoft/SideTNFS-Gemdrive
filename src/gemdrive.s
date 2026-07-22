@@ -1076,13 +1076,29 @@ _notlong:
 
 ; Get the storage space available on the disk
 .Dfree:
-    move.w 8(a0),d3                      ; get the drive number
-    subq.w #1, d3                        ; Remove 1 to the drive number. I don't want to use the default drive
-    move.w d3, d0                        ; d0 = drive number to search for
+    move.w 8(a0),d3                      ; get the GEMDOS unit (0 = current drive, else drive+1)
+    move.l 10(a0),a4                     ; get the address of the structure to store the information
+                                         ; (read a0 now, before it may be clobbered by Dgetdrv() below)
+    tst.w d3                             ; Check if the unit is 0 (current drive)
+    bne.s .dfree_use_unit                ; If not 0, convert the given unit to a 0-based drive number
+
+    reentry_gem_lock
+    gemdos Dgetdrv, 2                    ; Call Dgetdrv() and get the current 0-based drive number
+    move.l d0, -(sp)                     ; Save the return value with the drive number
+    reentry_gem_unlock
+    move.l (sp)+, d3                     ; Restore the drive number
+    bra.s .dfree_check_drive
+
+.dfree_use_unit:
+    subq.w #1, d3                        ; Remove 1 to the drive number. A is 0, B is 1, C is 2, etc.
+
+.dfree_check_drive:
+    move.w d3, d0                        ; d0 = 0-based GEMDOS drive number to search for
     bsr find_drive_slot_by_number        ; d0 = slot index, or -1 if not one of the emulated drives
     tst.w d0
     bmi .exec_old_handler                ; If not, exec_old_handler the code
-    move.l 10(a0),a4                     ; get the address of the structure to store the information
+
+    ; d3.w = the resolved 0-based GEMDOS drive number (not the slot index)
     send_sync CMD_DFREE_CALL, 2          ; Send the command to the Sidecart. 2 bytes of payload
 
     move.l GEMDRVEMUL_DFREE_STATUS, d0   ; Copy here the result status of the Dfree call
@@ -1132,18 +1148,30 @@ _notlong:
 
 .Dgetpath:
     move.l 8(a0),a4                      ; Address to the  new GEMDOS path
-    move.w 12(a0),d3                     ; get the drive number
-    tst.w d3                             ; Check if the drive number is 0 (current drive)
-    beq.s .Dgetpath_current_drive        ; If it's the current drive, continue with the code
+    move.w 12(a0),d3                     ; get the GEMDOS unit (0 = current drive, else drive+1)
+    tst.w d3                             ; Check if the unit is 0 (current drive)
+    bne.s .dgetpath_use_unit             ; If not 0, convert the given unit to a 0-based drive number
+
+    reentry_gem_lock
+    gemdos Dgetdrv, 2                    ; Call Dgetdrv() and get the current 0-based drive number
+    move.l d0, -(sp)                     ; Save the return value with the drive number
+    reentry_gem_unlock
+    move.l (sp)+, d3                     ; Restore the drive number
+    bra.s .dgetpath_check_drive
+
+.dgetpath_use_unit:
     subq.w #1, d3                        ; Remove 1 to the drive number. A is 0, B is 1, C is 2, etc.
-    move.w d3, d0                        ; d0 = drive number to search for
+
+.dgetpath_check_drive:
+    move.w d3, d0                        ; d0 = 0-based GEMDOS drive number to search for
     bsr find_drive_slot_by_number        ; d0 = slot index, or -1 if not one of the emulated drives
     tst.w d0
     bmi .exec_old_handler                ; If not, exec_old_handler the code
 
-.Dgetpath_current_drive:
-;    detect_emulated_drive                ; Check if the drive is the emulated one. If not, exec_old_handler the code.
-    ; This is the emulated drive, it's our moment!
+    ; This is the emulated drive, it's our moment! d3.w = the resolved 0-based
+    ; GEMDOS drive number (not the slot index) -- there is no more implicit
+    ; "d3==0 means slot 0" special case, the current drive is always
+    ; resolved via Dgetdrv() above.
     send_sync CMD_DGETPATH_CALL, 2       ; Two bytes of payload
 
     move.w #$7F, d0                      ; Maximum length of the path
@@ -1541,7 +1569,20 @@ _notlong:
 
 ;    bra .exec_old_handler                ; Now it's safe to execute the old handler
 
+; CMD_FSFIRST_CALL wire layout (68k -> Pico), 12-byte fixed header + 192-byte
+; path buffer, byte-for-byte unchanged except for d4's high word:
+;   d3.l = DTA address                                   (unchanged)
+;   d4.w (low word)  = GEMDOS Fsfirst attributes          (unchanged, the only
+;                       part of d4 the Pico currently reads)
+;   d4.w (high word) = 0-based runtime slot index         (new; currently
+;                       unread/ignored by the Pico side -- see find_drive_slot_by_letter/
+;                       find_drive_slot_by_number, whichever matched above)
+;   d5.l = address of the file specification string       (unchanged)
 .fs_first_emulated:
+    and.l #$FFFF, d4                     ; Clear any leftover register material from d4's high word
+    swap d0                              ; d0 = slot index moved into the high word (low word now 0)
+    or.l d0, d4                          ; d4 = (slot<<16) | attribs -- see wire layout note above
+
     reentry_gem_lock
 
     gemdos Fgetdta, 2                    ; Call Fgetdta() and get the address of the DTA
