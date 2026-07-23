@@ -1076,9 +1076,17 @@ _notlong:
 
 ; Get the storage space available on the disk
 .Dfree:
-    move.w 8(a0),d3                      ; get the GEMDOS unit (0 = current drive, else drive+1)
-    move.l 10(a0),a4                     ; get the address of the structure to store the information
+    ; GEMDOS Dfree(DISKINFO *buf, WORD drv): buf is the first (LONG) argument
+    ; at offset 8, drv is the second (WORD) argument at offset 12 -- same
+    ; layout as .Dgetpath/.Fopen/.Fseek's own (LONG, WORD, ...) arguments
+    ; just below. The previous 8(a0)/10(a0) pair was off by one field: it
+    ; read drv's word from buf's own high word (offset 8-9), and then read
+    ; a4 as a long spanning buf's low word (10-11) plus drv (12-13) -- e.g.
+    ; buf=$000099BA, drv=$000E produced a4=$99BA000E, a bogus DISKINFO
+    ; pointer (see report).
+    move.l 8(a0),a4                      ; get the address of the structure to store the information
                                          ; (read a0 now, before it may be clobbered by Dgetdrv() below)
+    move.w 12(a0),d3                     ; get the GEMDOS unit (0 = current drive, else drive+1)
     tst.w d3                             ; Check if the unit is 0 (current drive)
     bne.s .dfree_use_unit                ; If not 0, convert the given unit to a 0-based drive number
 
@@ -1118,7 +1126,14 @@ _notlong:
     move.l 8(a0),a4                      ; get the fpath address
 
     detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code
+                                         ; d0.w = slot index of the matched drive: the explicit "X:" prefix in the
+                                         ; path if present, otherwise the current GEMDOS drive (via Dgetdrv())
 
+    ; This is an emulated drive, it's our moment! Hand the already-resolved
+    ; slot to the Sidecart the same proven way .Dsetpath already does --
+    ; d3's low word, entirely unused otherwise in this call's d3/d4/d5
+    ; send_write_sync header.
+    move.w d0, d3                        ; d3.w = slot index, sent as the CMD_DCREATE_CALL payload's 1st register
     send_write_sync CMD_DCREATE_CALL, 256 ; Send the command to the Sidecart. 256 bytes of buffer to send
 
     return_interrupt_w GEMDRVEMUL_DCREATE_STATUS    ; Return the error code from the Sidecart
@@ -1127,7 +1142,14 @@ _notlong:
     move.l 8(a0),a4                      ; get the fpath address
 
     detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code
+                                         ; d0.w = slot index of the matched drive: the explicit "X:" prefix in the
+                                         ; path if present, otherwise the current GEMDOS drive (via Dgetdrv())
 
+    ; This is an emulated drive, it's our moment! Hand the already-resolved
+    ; slot to the Sidecart the same proven way .Dsetpath already does --
+    ; d3's low word, entirely unused otherwise in this call's d3/d4/d5
+    ; send_write_sync header.
+    move.w d0, d3                        ; d3.w = slot index, sent as the CMD_DDELETE_CALL payload's 1st register
     send_write_sync CMD_DDELETE_CALL, 256 ; Send the command to the Sidecart. 256 bytes of buffer to send
 
     return_interrupt_w GEMDRVEMUL_DDELETE_STATUS    ; Return the error code from the Sidecart
@@ -1193,10 +1215,18 @@ _notlong:
     move.w 12(a0),d3                     ; get mode attribute
 
     detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code
+                                         ; d0.w = slot index of the matched drive: the explicit "X:" prefix in the
+                                         ; path if present, otherwise the current GEMDOS drive (via Dgetdrv())
 
-    ; This is an emulated drive, it's our moment!
+    ; This is an emulated drive, it's our moment! Hand the already-resolved
+    ; slot to the Sidecart the same proven way .Dsetpath/.fs_first_emulated
+    ; already do -- d4's low word, an otherwise entirely unused register in
+    ; this call's existing d3/d4/d5 send_write_sync header (d3 = mode,
+    ; d5 = unused), so it can never overlap the mode, the pathname buffer,
+    ; or any response field (status/handle).
+    move.w d0, d4                        ; d4.w = slot index, sent as the CMD_FOPEN_CALL payload's 2nd register
     send_write_sync CMD_FOPEN_CALL, 256
-    
+
     return_interrupt_l GEMDRVEMUL_FOPEN_HANDLE    ; Return the error code from the Sidecart
 
 .Fclose:
@@ -1214,8 +1244,13 @@ _notlong:
     move.w 12(a0),d3                     ; get mode attribute
 
     detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code
+                                         ; d0.w = slot index of the matched drive: the explicit "X:" prefix in the
+                                         ; path if present, otherwise the current GEMDOS drive (via Dgetdrv())
 
-    ; This is an emulated drive, it's our moment!
+    ; This is an emulated drive, it's our moment! Same slot handoff as
+    ; .Fopen above -- d4's low word, otherwise unused in this call's
+    ; d3/d4/d5 header (d3 = mode, d5 = unused).
+    move.w d0, d4                        ; d4.w = slot index, sent as the CMD_FCREATE_CALL payload's 2nd register
     send_write_sync CMD_FCREATE_CALL, 256
 
     return_interrupt_w GEMDRVEMUL_FCREATE_HANDLE    ; Return the error code from the Sidecart
@@ -1224,33 +1259,58 @@ _notlong:
     move.l 8(a0),a4                      ; get the fpname address
 
     detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code
+                                         ; d0.w = slot index of the matched drive: the explicit "X:" prefix in the
+                                         ; path if present, otherwise the current GEMDOS drive (via Dgetdrv())
 
-    ; This is an emulated drive, it's our moment!
+    ; This is an emulated drive, it's our moment! Hand the already-resolved
+    ; slot to the Sidecart the same proven way .Dsetpath already does --
+    ; d3's low word, entirely unused otherwise in this call's d3/d4/d5
+    ; send_write_sync header.
+    move.w d0, d3                        ; d3.w = slot index, sent as the CMD_FDELETE_CALL payload's 1st register
     send_write_sync CMD_FDELETE_CALL, 256
 
     return_interrupt_w GEMDRVEMUL_FDELETE_STATUS    ; Return the error code from the Sidecart
 
 .Frename:
-    move.l 10(a0),a5                     ; get the fpname address
-    move.l 14(a0),a6                    ; get the new fpname address
+    move.l 10(a0),a5                     ; get the old (source) fpname address
+    move.l 14(a0),a6                     ; get the new (destination) fpname address
 
-    detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code
+    ; Fase 11B: resolve BOTH paths' own runtime slot, independently, via
+    ; the same detect_emulated_drive_letter macro every other slot-aware
+    ; handler uses. Previously this call invoked the macro only once and
+    ; WITHOUT pointing a4 at either path first -- a4 still held whatever
+    ; was left over from before this trap, so the "is this drive one of
+    ; ours" gate was effectively checking unrelated data, not the actual
+    ; source path, and the destination path was never checked against the
+    ; macro at all. Both paths are now checked explicitly; a resolution
+    ; failure on EITHER one correctly falls through to the original TOS
+    ; handler (nothing has been sent yet at this point), same as every
+    ; other slot-aware call.
+    move.l a5,a4                         ; a4 -> source path, for the macro
+    detect_emulated_drive_letter         ; If not, exec_old_handler. Otherwise d0.w = source path's resolved slot
+    move.w d0,d3                         ; d3.w = source-path resolved slot (saved before the next macro call)
+
+    move.l a6,a4                         ; a4 -> destination path, for the macro
+    detect_emulated_drive_letter         ; If not, exec_old_handler. Otherwise d0.w = destination path's resolved slot
+    move.w d0,d4                         ; d4.w = destination-path resolved slot
 
     lea -256(sp), sp
     move.l sp, a4
 
-    move.w #127, d3
+    move.w #127, d0                      ; Fase 11B: loop counter moved from d3 to d0 -- d3 now carries the source slot
 .frename_copy_src:
     move.b (a5)+, (a4)+
-    dbf d3, .frename_copy_src
+    dbf d0, .frename_copy_src
 
-    move.w #127, d3
+    move.w #127, d0
 .frename_copy_dst:
     move.b (a6)+, (a4)+
-    dbf d3, .frename_copy_dst
+    dbf d0, .frename_copy_dst
 
     move.l sp, a4
-    ; This is an emulated drive, it's our moment!
+    ; This is an emulated drive, it's our moment! d3.w = source-path slot,
+    ; d4.w = destination-path slot -- sent as the CMD_FRENAME_CALL
+    ; payload's existing d3/d4/d5 header (d5 unused).
     send_write_sync CMD_FRENAME_CALL, 256
     lea 256(sp), sp
 
@@ -1273,8 +1333,15 @@ _notlong:
     move.w 14(a0),d4                     ; get the attribute
 
     detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code
+                                         ; d0.w = slot index of the matched drive: the explicit "X:" prefix in the
+                                         ; path if present, otherwise the current GEMDOS drive (via Dgetdrv())
 
-    ; This is an emulated drive, it's our moment!
+    ; This is an emulated drive, it's our moment! Hand the already-resolved
+    ; slot to the Sidecart the same proven way .Fopen/.Fcreate already do --
+    ; d5's low word, the one otherwise-unused register in this call's
+    ; existing d3/d4/d5 send_write_sync header (d3 = mode flag, d4 = new
+    ; attribute value, both already in use).
+    move.w d0, d5                        ; d5.w = slot index, sent as the CMD_FATTRIB_CALL payload's 3rd register
     send_write_sync CMD_FATTRIB_CALL, 128
 
     return_interrupt_l GEMDRVEMUL_FATTRIB_STATUS    ; Return the error code from the Sidecart
