@@ -1715,16 +1715,40 @@ _notlong:
     move.l 18(a0), d7                     ; get the address of the environment string
 
     detect_emulated_drive_letter          ; If not, exec_old_handler the code. Otherwise continue with the code
+                                           ; d0.w = resolved runtime slot for the target path
 
-    send_sync CMD_PEXEC_CALL, 20          ; Send the command to the Sidecart. 16 bytes of buffer to send    
+    ; Fase 11D: stash the resolved slot across CMD_PEXEC_CALL below -- d3
+    ; (mode), d4 (a0, the trap frame pointer), d5 (fname), d6 (cmdline) and
+    ; d7 (envstr) are ALL already claimed for CMD_PEXEC_CALL's own payload,
+    ; and send_sync itself overwrites d0 with the command code, so there is
+    ; no free register left to carry the slot in until CMD_FOPEN_CALL is
+    ; sent further down. Without this, d4 at that point still held its
+    ; original "move.l a0,d4" value from Pexec's own entry (the trap frame
+    ; pointer, never the resolved slot) -- exactly the same stale-register
+    ; class of bug found and fixed in .Frename (Fase 11B), just with the
+    ; stash landing on the wrong side of an intervening command send
+    ; instead of a missing a4 assignment.
+    move.w d0, -(sp)
+
+    send_sync CMD_PEXEC_CALL, 20          ; Send the command to the Sidecart. 16 bytes of buffer to send
 
     cmp.w #PE_LOAD_GO, GEMDRVEMUL_PEXEC_MODE    ; Check if the mode is PE_LOAD_GO
     beq.s .pexec_load_go                        ; If yes, continue with the code
     cmp.w #PE_LOAD, GEMDRVEMUL_PEXEC_MODE       ; Check if the mode is PE_LOAD
-    bne .exec_old_handler                       ; if not, exec_old_handler the code
+    beq.s .pexec_load_go                        ; If yes, continue with the code too
+    ; Fase 11D: neither mode matched -- falling back to the original TOS
+    ; handler. Discard the stashed slot first so the stack is exactly as
+    ; deep as it was at .Pexec's own entry (.exec_old_handler's
+    ; restore_regs expects the save_regs frame to be immediately on top of
+    ; the stack, same as every other .exec_old_handler exit in this file).
+    addq.l #2, sp
+    bra .exec_old_handler
 
 .pexec_load_go:
-    clr.w d3                              ; open mode read only 
+    move.w (sp)+, d4                      ; Fase 11D: recover the resolved slot into d4 -- sent as the
+                                           ; CMD_FOPEN_CALL payload's 2nd register, the exact same
+                                           ; convention .Fopen itself already uses (Fase 10).
+    clr.w d3                              ; open mode read only
     send_write_sync CMD_FOPEN_CALL, 256
     move.l GEMDRVEMUL_FOPEN_HANDLE, d0    ; Error code obtained from the Sidecart
     ; If d0 is negative, there is an error
