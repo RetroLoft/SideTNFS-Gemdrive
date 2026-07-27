@@ -2121,9 +2121,9 @@ _notlong:
 ; digits are therefore printed at runtime instead (see rom_function below);
 ; this string stops right after "v" on purpose.
 gemdrive_emulator_msg:
-        dc.b	"SidecarTridge multidevice"
+        dc.b	"SideTNFS multidrive"
         dc.b    $d,$a,$a
-        dc.b    "GEMDRIVE - v",0
+        dc.b    "GEMDRIVE core - v",0
 
 spacing:
         dc.b    $d,$a,$d,$a,0
@@ -2162,7 +2162,7 @@ validate_drive_table_msg:
         dc.b	"[..] Checking drive table...",0
 
 emulated_drive_msg:
-        dc.b	"[..] Emulating drive ",0
+        dc.b	"[..] Drives installed ",0
 
 ready_gemdrive_msg:
         dc.b	"[..] GEMDRIVE driver loaded...",0
