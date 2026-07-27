@@ -400,17 +400,19 @@ _ping_ready:
     bne _exit_invalid_table
     print ok_msg
 
-; Show the disk drive to emulate
+; List every installed drive, read from the same validated table
+; create_virtual_hard_disk uses -- no second drive administration, no
+; assumption about the first letter or about the letters being contiguous.
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_COUNT * 4)), d0
+    tst.l d0
+    beq.s .no_drives_installed
     print emulated_drive_msg
-    move.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), d0   ; Get the drive number of slot 0 (the primary/default drive)
-    add.w #'A', d0                                                                             ; Convert to its drive letter
-    pchar_reg
-    pchar ':'
-    pchar '\'
-    pchar ' '
-    pchar ' '
-    pchar ' '
+    bsr print_installed_drives
     print ok_msg
+    bra.s .drives_listed
+.no_drives_installed:
+    print no_drives_msg
+.drives_listed:
 
 ; Set the virtual hard disk
     tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_FAKE_FLOPPY * 4)) ; Do we want to simulate a floppy drive to launch AUTO programs?
@@ -866,9 +868,7 @@ clean_gem_reentry_lock:
     bra send_sync_command_to_sidecart
 
 ; Set one _drvbits bit for every entry in the active-drive table, then make
-; slot 0 the current/default drive via Dsetdrv(). With
-; SHARED_VARIABLE_DRIVE_COUNT effectively pinned to 1 in this phase, this is
-; byte-for-byte equivalent to the previous single-drive behaviour.
+; slot 0 the current/default drive via Dsetdrv().
 create_virtual_hard_disk:
     movem.l d1-d3/a5,-(sp)
     move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_COUNT * 4)), d2       ; d2 = number of active drives
@@ -890,6 +890,69 @@ create_virtual_hard_disk:
     move.w (GEMDRVEMUL_SHARED_VARIABLES + 2 + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), -(sp)  ; Slot 0 becomes the current/default drive
     gemdos Dsetdrv, 4                    ; Call Dsetdrv() and set the emulated drive
     movem.l (sp)+, d1-d3/a5
+    rts
+
+; Print every installed drive letter as "X:", separated by a single space,
+; in ascending order -- reading the very same shared drive-number table
+; create_virtual_hard_disk installs, so there is only one drive
+; administration. The table is in slot order, not letter order, and its
+; letters need not be contiguous, so entries are emitted by repeated
+; minimum: each pass prints the smallest entry still above the one printed
+; before it. validate_drive_table has already rejected duplicates, so that
+; ordering is unambiguous and needs no scratch buffer to sort into.
+;
+; Reads at most SIDETNFS_MAX_RUNTIME_DRIVES entries even if the count were
+; larger than the table, so it can never run off the end of the table.
+; Output is at most SIDETNFS_MAX_RUNTIME_DRIVES * 3 characters, which fits
+; the boot line well within 80 columns.
+;
+; Only registers GEMDOS preserves across Cconout (d3-d7/a5) hold state
+; across the character output inside the loop.
+; Modifies: nothing (all registers preserved)
+print_installed_drives:
+    movem.l d3-d7/a5,-(sp)
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_COUNT * 4)), d5  ; d5 = entries to consider
+    cmp.l #SIDETNFS_MAX_RUNTIME_DRIVES, d5
+    bls.s .print_installed_drives_count_ok
+    move.l #SIDETNFS_MAX_RUNTIME_DRIVES, d5                                       ; clamp: never read past the table
+.print_installed_drives_count_ok:
+    moveq #-1, d4                        ; d4 = last drive number printed (none yet)
+    moveq #0, d3                         ; d3 = letters printed so far
+.print_installed_drives_outer:
+    cmp.l d5, d3
+    bge.s .print_installed_drives_done
+    move.w #256, d6                      ; d6 = smallest entry found this pass (above any 0..25)
+    lea (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_DRIVE_NUMBER_TABLE * 4)), a5
+    move.l d5, d7                        ; d7 = entries left to scan
+.print_installed_drives_scan:
+    tst.l d7
+    beq.s .print_installed_drives_scanned
+    move.w 2(a5), d0                     ; d0 = drive_number[i]
+    cmp.w d4, d0
+    ble.s .print_installed_drives_next   ; already printed -- skip
+    cmp.w d6, d0
+    bge.s .print_installed_drives_next   ; not smaller than the best of this pass
+    move.w d0, d6
+.print_installed_drives_next:
+    addq.l #4, a5
+    subq.l #1, d7
+    bra.s .print_installed_drives_scan
+.print_installed_drives_scanned:
+    cmp.w #256, d6
+    beq.s .print_installed_drives_done   ; nothing left above d4 -- table exhausted
+    tst.l d3
+    beq.s .print_installed_drives_first
+    pchar ' '                            ; separator, never before the first letter
+.print_installed_drives_first:
+    move.w d6, d0
+    add.w #'A', d0                       ; drive number -> drive letter
+    pchar_reg
+    pchar ':'
+    move.w d6, d4                        ; remember it, so the next pass looks above it
+    addq.l #1, d3
+    bra.s .print_installed_drives_outer
+.print_installed_drives_done:
+    movem.l (sp)+, d3-d7/a5
     rts
 
 ; Read and validate the multi-drive table set by the Pico after PING:
@@ -2162,7 +2225,10 @@ validate_drive_table_msg:
         dc.b	"[..] Checking drive table...",0
 
 emulated_drive_msg:
-        dc.b	"[..] Drives installed ",0
+        dc.b	"[..] Drives installed: ",0
+
+no_drives_msg:
+        dc.b	"[--] No drives installed",$d,$a,0
 
 ready_gemdrive_msg:
         dc.b	"[..] GEMDRIVE driver loaded...",0
