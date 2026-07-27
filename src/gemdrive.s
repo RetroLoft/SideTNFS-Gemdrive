@@ -52,6 +52,29 @@ GEMDOS_SLOT_PROTOCOL_VERSION equ 1     ; Protocol version this ROM requires from
 SIDETNFS_MAX_ORDINARY_DRIVES equ 8     ; Configurable TNFS/SD drives (informational -- the 68k side is backend-agnostic and never distinguishes these from the CONFIG drive)
 SIDETNFS_MAX_RUNTIME_DRIVES  equ 9     ; SIDETNFS_MAX_ORDINARY_DRIVES + 1 CONFIG drive from flash -- number of slots in the shared drive_number table
 
+; Fase 9D (boot-countdowns moderniseren): the Pico publishes three distinct
+; states in GEMDRVEMUL_NETWORK_STATUS and GEMDRVEMUL_RTC_STATUS. Never test
+; either field with a plain tst.l/bne again: that reads GEMDRV_STATUS_FAILED
+; as success, which is exactly the bug this phase removes.
+GEMDRV_STATUS_BUSY      equ 0          ; Still working on it -- keep waiting
+GEMDRV_STATUS_FAILED    equ 1          ; Pico definitively gave up -- go straight to the KO path
+GEMDRV_STATUS_READY     equ -1         ; $FFFFFFFF -- the only value that means success
+
+; Fase 9D: per-phase wait budgets, in whole seconds, exactly one second per
+; visible counter step. These are fixed product constants and are
+; deliberately NOT read from GEMDRVEMUL_TIMEOUT_SEC (the legacy, configurable
+; PARAM_GEMDRIVE_TIMEOUT_SEC, default 45) anymore -- that single value used
+; to bound all three phases identically, so a failed NTP sync cost a full
+; 45-second countdown on every boot. Sized against the Pico's own current
+; budgets with margin: WiFi connect is 3 attempts x 5s = 15s
+; (SIDETNFS_WIFI_MAX_CONNECT_ATTEMPTS / _ATTEMPT_TIMEOUT_MS) and the single
+; initial NTP attempt is 3s (SIDETNFS_NTP_INITIAL_TIMEOUT_MS). The budgets
+; are only a backstop for a Pico that never publishes anything at all -- a
+; Pico that does publish GEMDRV_STATUS_FAILED short-circuits them entirely.
+NETWORK_WAIT_SEC        equ 18         ; Seconds to wait for GEMDRVEMUL_NETWORK_STATUS
+RTC_WAIT_SEC            equ 5          ; Seconds to wait for GEMDRVEMUL_RTC_STATUS
+PING_WAIT_SEC           equ 45         ; Seconds to wait for GEMDRVEMUL_PING_STATUS -- same value the Pico used to publish, now local
+
 ROM4_START_ADDR         equ $FA0000 ; ROM4 start address
 ROM3_START_ADDR         equ $FB0000 ; ROM3 start address
 ROM_EXCHG_BUFFER_ADDR   equ (ROM3_START_ADDR)               ; ROM4 buffer address
@@ -413,6 +436,18 @@ _ping_ready:
 ; This is where the clock is set.
     tst.l GEMDRVEMUL_RTC_ENABLED
     beq.s .exit_graciouslly
+
+; Fase 9D: only ever program the Atari clock when the Pico has actually
+; published a synchronised date/time this boot (GEMDRVEMUL_RTC_STATUS ==
+; GEMDRV_STATUS_READY). With GEMDRV_STATUS_BUSY (never synchronised) or
+; GEMDRV_STATUS_FAILED (Pico gave up), GEMDRVEMUL_RTC_DATETIME_BCD and
+; GEMDRVEMUL_RTC_DATETIME_MSDOS were never written, and the old
+; unconditional call fed that uninitialised shared memory straight into
+; IKBD (XBIOS 25) and XBIOS settime.
+    move.l GEMDRVEMUL_RTC_STATUS, d0
+    cmp.l #GEMDRV_STATUS_READY, d0
+    bne.s .exit_graciouslly
+
     bsr setup_datetime
 
 .exit_graciouslly:
@@ -462,7 +497,13 @@ print_tos_version:
 
 ; Wait for the RPP2040 to have a mounted folder in the SD card
 test_ping:
-    move.l GEMDRVEMUL_TIMEOUT_SEC, d7           ; Wait for a while until ping responds
+; Fase 9D: fixed local budget instead of GEMDRVEMUL_TIMEOUT_SEC. The value
+; is unchanged (45) -- it is the same number the Pico published from the
+; legacy PARAM_GEMDRIVE_TIMEOUT_SEC default -- so ping timing is
+; bit-for-bit identical to before; only its source moved into this ROM.
+; GEMDRVEMUL_PING_STATUS stays a two-state word (0/1), not a three-state
+; longword, so it keeps its existing tst.w test below.
+    moveq #PING_WAIT_SEC, d7            ; Wait for a while until ping responds
 _retest_ping:
     move.w d7, -(sp)                 
 
@@ -501,8 +542,17 @@ _test_ping_timeout:
 
 ; wait for the RTC to be ready
 wait_rtc:
-    tst.l GEMDRVEMUL_RTC_STATUS     ; Test if the RTC is already started
-    beq.s _wait_rtc_start           ; If the RTC is not started, continue with the code
+; Fase 9D: ONLY GEMDRV_STATUS_READY counts as "already started". The old
+; tst.l/beq.s pair took any non-zero value as success, so the new
+; GEMDRV_STATUS_FAILED (1) would have been reported as a running RTC.
+; GEMDRV_STATUS_FAILED deliberately falls through to the wait path below
+; rather than jumping straight to _test_rtc_timeout: the loops there reach
+; the very same KO exit within one second, but do so underneath their
+; existing "[..] Network conf." / "[..] NTP synchronization..." labels
+; instead of printing a bare, unlabelled [KO] line. No new UI text.
+    move.l GEMDRVEMUL_RTC_STATUS, d0
+    cmp.l #GEMDRV_STATUS_READY, d0
+    bne.s _wait_rtc_start           ; If the RTC is not ready yet, continue with the code
     print rtc_already_started_msg
     print ok_msg
     rts                             ; We wait for the RTC to be ready, but we set the RTC at the end init
@@ -512,19 +562,35 @@ _wait_rtc_start:
     print query_network_msg
      
 ; Loop to wait for the Network to be ready
-    move.l GEMDRVEMUL_TIMEOUT_SEC, d7   ; Wait for a while until ping responds
+    moveq #NETWORK_WAIT_SEC, d7     ; Fase 9D: fixed local budget, no longer GEMDRVEMUL_TIMEOUT_SEC
 _wait_for_network_stack:
     move.w d7,d0                    ; Pass the number of seconds to print
     print_num                       ; Print the decimal number
     print backwards_msg
-    wait_sec
-    tst.l GEMDRVEMUL_NETWORK_STATUS ; Test if the network stack is ready
-    bne.s _wait_for_rtc             ; The network is ok. Wait for the RTC to be ready now
 
+; Fase 9D: exactly ONE second per displayed step. The old loop ran wait_sec
+; AND wait_sec_or_key_press per iteration, so the counter labelled in
+; seconds actually advanced at roughly two seconds per step (a full
+; 45-step timeout took ~92s of wall clock). wait_sec_or_key_press on its
+; own waits the same ~1 second but returns early on a keypress, so ESC
+; stays just as responsive while the visible counter now means real
+; seconds.
     wait_sec_or_key_press
     cmp.b #27,d0                    ; Check if ESC is pressed and continue
     beq _test_rtc_canceled          ; The user canceled the operation
 
+; Fase 9D: three-way status test. GEMDRV_STATUS_BUSY keeps waiting,
+; GEMDRV_STATUS_READY continues to the RTC phase, and anything else --
+; GEMDRV_STATUS_FAILED in practice -- goes straight to the KO path instead
+; of burning the rest of the budget. The old tst.l/bne.s pair here treated
+; GEMDRV_STATUS_FAILED as success.
+    move.l GEMDRVEMUL_NETWORK_STATUS, d0
+    beq.s .network_still_busy       ; GEMDRV_STATUS_BUSY -- keep waiting
+    cmp.l #GEMDRV_STATUS_READY, d0
+    beq.s _wait_for_rtc             ; The network is ok. Wait for the RTC to be ready now
+    bra _test_rtc_timeout           ; GEMDRV_STATUS_FAILED -- the Pico gave up, so do we
+
+.network_still_busy:
     dbf d7, _wait_for_network_stack ; The network is not ready yet, wait a bit more
     bra _test_rtc_timeout         ; The network stack is not ready yet, timeout now
 
@@ -533,14 +599,28 @@ _wait_for_rtc:
     print ok_msg
     print query_ntp_msg
 
-    move.l GEMDRVEMUL_TIMEOUT_SEC, d7       ; Wait for a while until the RTC is ready
+    moveq #RTC_WAIT_SEC, d7         ; Fase 9D: fixed local budget, no longer GEMDRVEMUL_TIMEOUT_SEC
 _wait_for_rtc_loop:
     move.w d7,d0                    ; Pass the number of seconds to print
     print_num                       ; Print the decimal number
     print backwards_msg
-    wait_sec
-    tst.l GEMDRVEMUL_RTC_STATUS     ; Test if the RTC is ready
-    bne.s _rtc_ready                ; The RTC is ready to start now
+
+; Fase 9D: ESC now aborts the RTC/NTP wait too, using the same primitive,
+; the same one-second-per-step timing and the same cancel path as the
+; network loop above. This loop previously used a bare wait_sec, so the
+; user had no way out of it at all.
+    wait_sec_or_key_press
+    cmp.b #27,d0                    ; Check if ESC is pressed and continue
+    beq _test_rtc_canceled          ; The user canceled the operation
+
+; Fase 9D: three-way status test, exactly as in the network loop above.
+    move.l GEMDRVEMUL_RTC_STATUS, d0
+    beq.s .rtc_still_busy           ; GEMDRV_STATUS_BUSY -- keep waiting
+    cmp.l #GEMDRV_STATUS_READY, d0
+    beq.s _rtc_ready                ; The RTC is ready to start now
+    bra _test_rtc_timeout           ; GEMDRV_STATUS_FAILED -- NTP definitively failed
+
+.rtc_still_busy:
     dbf d7, _wait_for_rtc_loop      ; The RTC is not ready yet, wait a bit more
     bra _test_rtc_timeout         ; The RTC is not ready yet, timeout now
 _rtc_ready:
