@@ -72,7 +72,7 @@ GEMDRV_STATUS_READY     equ -1         ; $FFFFFFFF -- the only value that means 
 ; are only a backstop for a Pico that never publishes anything at all -- a
 ; Pico that does publish GEMDRV_STATUS_FAILED short-circuits them entirely.
 NETWORK_WAIT_SEC        equ 18         ; Seconds to wait for GEMDRVEMUL_NETWORK_STATUS
-RTC_WAIT_SEC            equ 5          ; Seconds to wait for GEMDRVEMUL_RTC_STATUS
+RTC_WAIT_SEC            equ 15         ; Seconds to wait for GEMDRVEMUL_RTC_STATUS
 PING_WAIT_SEC           equ 45         ; Seconds to wait for GEMDRVEMUL_PING_STATUS -- same value the Pico used to publish, now local
 
 ROM4_START_ADDR         equ $FA0000 ; ROM4 start address
