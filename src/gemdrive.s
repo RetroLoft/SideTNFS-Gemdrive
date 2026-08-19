@@ -590,7 +590,10 @@ _wait_for_network_stack:
     beq.s .network_still_busy       ; GEMDRV_STATUS_BUSY -- keep waiting
     cmp.l #GEMDRV_STATUS_READY, d0
     beq.s _wait_for_rtc             ; The network is ok. Wait for the RTC to be ready now
-    bra _test_rtc_timeout           ; GEMDRV_STATUS_FAILED -- the Pico gave up, so do we
+    bra _network_not_available      ; GEMDRV_STATUS_FAILED -- the Pico already knows there is
+                                     ; no WiFi to try (no SSID configured) or gave up after its
+                                     ; own retries; either way this is not a timeout, so it gets
+                                     ; its own message instead of sharing "[KO] Timeout!" below
 
 .network_still_busy:
     dbf d7, _wait_for_network_stack ; The network is not ready yet, wait a bit more
@@ -680,6 +683,14 @@ _ignore_y2k:
 
 _test_rtc_timeout:
     print timeout_msg
+    moveq #-1, d0
+    rts
+
+; Same outcome as _test_rtc_timeout (RTC/NTP sync skipped for this boot)
+; but reached instantly rather than after waiting out NETWORK_WAIT_SEC --
+; see its own call site's comment above.
+_network_not_available:
+    print not_available_msg
     moveq #-1, d0
     rts
 
@@ -2246,7 +2257,10 @@ ok_msg:
         dc.b	$d, "[OK]",$d,$a,0
 
 timeout_msg:
-        dc.b	$d, 27, "K[KO] Timeout!",$d,$a,0 
+        dc.b	$d, 27, "K[KO] Timeout!",$d,$a,0
+
+not_available_msg:
+        dc.b	$d, 27, "K[NA] Not available!",$d,$a,0
 
 canceled_msg:
         dc.b	$d, 27, "K[KO] Canceled!",$d,$a,0 
