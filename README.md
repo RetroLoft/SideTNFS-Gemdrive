@@ -1,119 +1,112 @@
-# ATARI ST SidecarTridge Multi-device GEMDRIVE Firmware
+# SideTNFS GEMDRIVE
 
-This repository hosts the firmware code for the SidecarTridge Multi-device Hard disk GEM drive emulator designed for Atari ST/STE/Mega systems. In tandem with the [SidecarTridge Multi-device Raspberry Pico firmware](https://github.com/diegoparrilla/atarist-sidecart-raspberry-pico), this firmware facilitates the functioning of the GEMDRIVE.
+> **This repository is part of [SideTNFS-Firmware](https://github.com/RetroLoft/SideTNFS-Firmware).** It is not a standalone product: it builds `GEMDRIVE.BIN`, and the firmware repository embeds that exact binary into the Pico's own flash memory as a C word array, so it can hand it to the Atari as the boot-time GEMDOS hard-disk driver. See [How this gets into the firmware](#how-this-gets-into-the-firmware) below for the full picture.
 
-## Introduction
+## What this is
 
-The functionality of SidecarTridge Multi-device extends beyond the realm of simple ROM emulation; it also has the capacity to perform various additional operations.
+GEMDRIVE is the 68000 assembly ROM that turns a SideTNFS Raspberry Pi Pico cartridge into a **GEMDOS hard-disk emulator** for the Atari ST family. It's what makes drives like `C:`, `N:`, or the read-only Settings disk `S:` show up as ordinary GEMDOS drives at all — every `Fopen`, `Fread`, `Dsetpath`, directory listing, and so on that an Atari program issues against one of those drives is intercepted here and relayed to the Pico over the cartridge's own ROM3 bus, which then serves it from whichever backend that drive is configured for (a TNFS network share, a microSD card, or the built-in Settings disk). Any unmodified GEMDOS software just sees a hard disk.
 
-The GEMDRIVE is a hard disk emulator that leverages the SidecarTridge Multi-device to simulate the function of the Atari ST hard disk GEM drive.
+This is a different kind of component from [SideTNFS-Config](https://github.com/RetroLoft/SideTNFS-Config): that repository builds `SIDETNFS.PRG`, an ordinary GEM application you launch from the desktop to *configure* drives. This repository builds the driver that makes configured drives *work* in the first place, and it runs automatically at boot — there is nothing to launch.
 
-The source is bifurcated into:
+The source in `src/` is split into:
 
-1. The driver, an assembler program in `/src` directory within the file `gemdrive.s`.
+- **`gemdrive.s`** — the driver itself: the GEMDOS hard-disk emulation logic and the calls to the Multi-device over the cartridge bus.
+- **`main.s`** — the bootstrap ROM: a standard SidecarTridge cartridge header (magic number `$abcdef42` at `$FA0000`, name, timestamp, entry point, ...) that embeds the driver and starts it after GEMDOS init, before the Atari boots from disk. This is what actually gets linked into `GEMDRIVE.BIN`.
+- **`gemdrive_prg.s`** — a normal GEMDOS `.PRG` wrapper around the same driver, used only to test the driver's logic in an emulator (e.g. Hatari) without needing real SidecarTridge hardware. See [Testing without hardware](#testing-without-hardware) below.
+- **`inc/`** — shared TOS constants, SidecarTridge hardware macros (`send_sync` and friends, for talking to the Multi-device), and debug helpers (Hatari Natfeats logging) used by the files above.
 
-2. A bootstrapping ROM, an assembly program housed in the `/src` directory within the file `main.s`. This ROM embeds the driver and launches it.
-
-There is also a third file in `src` called `gemdrive_prg.s` created for testing purposes in emulators, for example.
-
-**Note**: This ROM cannot be loaded or emulated like conventional ROMs. It has to be merged directly into the SidecarTridge Multi-device RP2040 firmware. Additional details are available in the [SidecarTridge Multi-device Raspberry Pico firmware](https://github.com/diegoparrilla/atarist-sidecart-raspberry-pico).
-
-Newcomers are encouraged to peruse the official [device website](https://sidecartridge.com) for a comprehensive understanding.
+**A cartridge ROM image, not a `.PRG`:** building `main.s` + `gemdrive.s` produces `GEMDRIVE.BIN`, a raw 68000 ROM binary (linked with vlink's `-brawbin1` format) containing the cartridge header and driver code back to back. It is not a GEMDOS executable and can't be copied to a disk and run — it only makes sense mapped into the Pico's cartridge-ROM emulation address space, which is exactly what `SideTNFS-Firmware` does with it.
 
 ## Requirements
 
-- An Atari ST/STE/MegaST/MegaSTE computer. You can also use an emulator such as Hatari or STEEM for testing purposes, but you cannot really test the GEMDRIVE functionality there.
+Building `GEMDRIVE.BIN` needs a 68000 **assembler and linker**, not a C compiler — this repository is pure 68000 assembly, so the `m68k-atari-mint-gcc` cross-compiler that [SideTNFS-Config](https://github.com/RetroLoft/SideTNFS-Config) needs for its C code is not involved here at all.
 
-- The [atarist-toolkit-docker](https://github.com/diegoparrilla/atarist-toolkit-docker) is pivotal. Familiarize yourself with its installation and usage.
+- **Toolchain: `vasm`/`vasmm68k_mot` (a Devpac-compatible 68000 assembler) and `vlink` (its matching linker)**, invoked as `vasm`/`vlink` from the `Makefile`s. Neither has a native Debian/Ubuntu package with 68000 support — the practical way to get them is:
 
-- A `git` client, command line or GUI, your pick.
+  **[`atarist-toolkit-docker`](https://github.com/sidecartridge/atarist-toolkit-docker)** — a Docker image bundling `vasm`/`vlink` (plus `m68k-atari-mint-gcc`, unused by this repo) for Atari ST development, from the same `sidecartridge`/RetroLoft project family. It's driven through a small `stcmd` wrapper that runs commands inside the container:
+  ```
+  # Linux/macOS installer
+  curl -sL https://github.com/sidecartridge/atarist-toolkit-docker/releases/download/latest/install_atarist_toolkit_docker.sh | bash
 
-- A Makefile attuned with GNU Make.
+  # Windows: download and run from the releases page
+  # https://github.com/sidecartridge/atarist-toolkit-docker/releases/latest
+  #   install_atarist_toolkit_docker.cmd
+  ```
+  `stcmd` needs `ST_WORKING_FOLDER` set to the absolute path of this repository's checkout — it's the folder mounted into the container:
+  ```
+  cd path/to/SideTNFS-Gemdrive
+  export ST_WORKING_FOLDER=`pwd`
+  ```
+  From there, every build command below is run as `stcmd <command>` instead of bare `<command>`.
 
-## Building the ROM
+- An Atari ST/STE/MegaST/MegaSTE, or an emulator such as [Hatari](https://hatari.tuxfamily.org/) for the assembly-level testing described in [Testing without hardware](#testing-without-hardware) — GEMDRIVE's actual drive emulation can only be exercised with real (or SidecarTridge-emulated) firmware behind it, so an emulator alone can't test the full round trip.
 
-You don't really need an Atari ST to build the binaries, just follow these steps to build the program:
+- A `git` client and a Makefile-compatible `make`.
 
-1. Clone this repository:
-
-```
-$ git clone https://github.com/diegoparrilla/atarist-sidecart-gemdrive.git
-```
-
-2. Navigate to the cloned repository:
-
-```
-cd atarist-sidecart-gemdrive
-```
-
-3. Trigger the `build.sh` script to build the ROM images:
-
-```
-./build.sh
-```
-
-4. The `dist` folder now houses the binary files: `GEMDRIVE.BIN`, which needs to be incorporated into the SidecarTridge Multi-device RP2040 firmware, and `GEMDRIVE.IMG`, a raw binary file tailored for direct emulation (intended for testing).
-
-## Developing GEMDRIVE
-
-For those inclined to tweak the ROM loader, it's possible. The GEMDRIVE is crafted in 68000 assembly and compiles via the [atarist-toolkit-docker](https://github.com/diegoparrilla/atarist-toolkit-docker).
-
-For illustration, let's use the Hatari emulator on macOS:
-
-1. Begin by ensuring the repository is cloned. If not:
+## Build
 
 ```
-$ git clone https://github.com/diegoparrilla/atarist-sidecart-gemdrive.git
+./build.sh <ST_WORKING_FOLDER> release
 ```
 
-2. Enter the cloned repository:
+This is exactly what CI runs on a tag push (see [Releases](#releases)). It builds via `stcmd`, then produces two files in `dist/`:
 
+- **`GEMDRIVE.BIN`** — the ROM image that gets embedded into `SideTNFS-Firmware` (see below).
+- **`GEMDRIVE.IMG`** — the same bytes, padded/truncated to a flat 64 KB, for loading directly in an emulator instead of through real SidecarTridge hardware.
+
+Equivalent by hand, without the wrapper script:
 ```
-cd atarist-sidecart-gemdrive
-```
-
-3. Establish the `ST_WORKING_FOLDER` environment variable, linking it to the root directory of the cloned repository:
-
-```
-export ST_WORKING_FOLDER=<ABSOLUTE_PATH_TO_THE_FOLDER_WHERE_YOU_CLONED_THE_REPO>
-```
-
-4. Embark on your code modifications within the `/src` folder. For insights on leveraging the environment, refer to the [atarist-toolkit-docker](https://github.com/diegoparrilla/atarist-toolkit-docker) examples.
-
-5. Leverage the provided Makefile for the build. The `stcmd` command connects with the tools in the Docker image. Engage the `_DEBUG` flag (set to 1) to activate debug messages and bypass direct ROM usage. There is also a `RELEASE_MODE` flag to enable construction for the final release. For example, to build the ROM in debug mode in an emulator this command will build a TOS file with testing data (loads an image in RAM):
-
-```
-stcmd make DEBUG_MODE=1 RELEASE_MODE=0
-```
-
-If you want to build a TOS file for testing with a SidecarTridge Multi-device and an Atari ST computer, run this:
-
-```
-stcmd make DEBUG_MODE=1 RELEASE_MODE=1
-```
-
-If you want to build a ROM binary for the firmware to embed in the RP2040 firmware, run this:
-
-```
+export ST_WORKING_FOLDER=`pwd`
 stcmd make DEBUG_MODE=0 RELEASE_MODE=1
 ```
 
-6. If `DEBUG_MODE=1` the outcome is `GEMDRIVE.TOS` in the `dist` folder. This file is ready for execution on the Atari ST emulator or computer. If using Hatari, you can launch it as follows (assuming `hatari` is path-accessible):
+> **Note:** the top-level `Makefile` also has a `DEBUG_MODE=1` route (`Makefile.debug`), but that file is leftover from a different SidecarTridge sub-project and references source files (`rtc.s`, `rtc_prg.s`) that don't exist in this repository — don't pass `DEBUG_MODE=1`. The two combinations documented on this page are the ones that actually build.
+
+## Testing without hardware
+
+For iterating on the driver logic itself without a real Atari or SidecarTridge cartridge, `gemdrive_prg.s` links the same `gemdrive.s` driver into an ordinary `.TOS` program instead of a cartridge ROM, runnable directly in an emulator:
 
 ```
-hatari --fast-boot true --tos-res med dist/GEMDRIVE.TOS &
+export ST_WORKING_FOLDER=`pwd`
+stcmd make
 ```
+
+(no `DEBUG_MODE`/`RELEASE_MODE` given routes to `Makefile.tos`, which links `gemdrive_prg.s` + `gemdrive.s`.) The result is `dist/BOOT.TOS`. In Hatari:
+
+```
+hatari --fast-boot true --tos-res med dist/BOOT.TOS
+```
+
+This still needs a running Multi-device to talk to for any actual drive emulation to succeed — it saves you the cartridge-boot cycle while working on the driver, not a full offline test.
+
+## How this gets into the firmware
+
+`SideTNFS-Firmware`'s `romemul/download_gemdrvemul.py` turns `GEMDRIVE.BIN` into `romemul/firmware_gemdrvemul.c` — a `const uint16_t gemdrvemulROM[]` array, 16 bits per entry to match the 68000's word bus, compiled straight into the Pico firmware image (wired in via `romemul/CMakeLists.txt`). That generated file is committed to the firmware repo directly — the script isn't run automatically by CI — so offline builds of the firmware stay reproducible.
+
+Unlike `SideTNFS-Config`'s generator, this script's `--input` doesn't default to pulling from this repository's own GitHub releases; it still points at the original upstream project's release asset. In practice, regenerating it means building locally and pointing `--input` at that local file.
+
+### Getting your own modified `GEMDRIVE.BIN` into the firmware
+
+1. **Build your modified ROM** in this repository (see [Build](#build) above) — you need `dist/GEMDRIVE.BIN`.
+
+2. **Regenerate the embedded C array** from a checkout of `SideTNFS-Firmware`, pointing the generator at your local build:
+
+   ```
+   cd SideTNFS-Firmware/romemul
+   python3 download_gemdrvemul.py --input ../../SideTNFS-Gemdrive/dist/GEMDRIVE.BIN
+   ```
+
+   (Adjust the relative path if the two repositories aren't checked out next to each other.) This overwrites `romemul/firmware_gemdrvemul.c` with your build.
+
+3. **Rebuild and flash the firmware** as usual — see `SideTNFS-Firmware`'s own `build.sh`/README. The new GEMDRIVE ROM is now part of that firmware image.
 
 ## Releases
 
-For releases, head over to the [Releases page](https://github.com/diegoparrilla/atarist-sidecart-gemdrive/releases). The latest release is always recommended.
+Pushing a `v*` tag triggers this repository's GitHub Actions release workflow, which builds and publishes both `GEMDRIVE.BIN` and `GEMDRIVE.IMG` to that tag and to the rolling `latest` tag. See the [Releases page](https://github.com/RetroLoft/SideTNFS-Gemdrive/releases).
 
-Note: The build output isn't akin to standard ROM images. The release files have to be incorporated into the SidecarTridge Multi-device RP2040 firmware.
+## Acknowledgements
 
-## Resources 
-
-- [SidecarTridge Multi-device Emulator website](https://sidecartridge.com)
-- [SidecarTridge Multi-device Raspberry Pico firmware](https://github.com/diegoparrilla/atarist-sidecart-raspberry-pico) - Where the second phase of the Sidecart ROM Emulator firmware evolution unfolds.
+This repository is a continuation of Diego Parrilla's original [`atarist-sidecart-gemdrive`](https://github.com/sidecartridge/atarist-sidecart-gemdrive), part of the wider [SidecarTridge](https://sidecartridge.com) project that SideTNFS builds on.
 
 ## License
 
