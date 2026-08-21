@@ -49,7 +49,7 @@ Building `GEMDRIVE.BIN` needs a 68000 **assembler and linker**, not a C compiler
 ./build.sh <ST_WORKING_FOLDER> release
 ```
 
-This is exactly what CI runs on a tag push (see [Releases](#releases)). It builds via `stcmd`, then produces two files in `dist/`:
+It builds via `stcmd`, then produces two files in `dist/`:
 
 - **`GEMDRIVE.BIN`** — the ROM image that gets embedded into `SideTNFS-Firmware` (see below).
 - **`GEMDRIVE.IMG`** — the same bytes, padded/truncated to a flat 64 KB, for loading directly in an emulator instead of through real SidecarTridge hardware.
@@ -102,7 +102,14 @@ Unlike `SideTNFS-Config`'s generator, this script's `--input` doesn't default to
 
 ## Releases
 
-Pushing a `v*` tag triggers this repository's GitHub Actions release workflow, which builds and publishes both `GEMDRIVE.BIN` and `GEMDRIVE.IMG` to that tag and to the rolling `latest` tag. See the [Releases page](https://github.com/RetroLoft/SideTNFS-Gemdrive/releases).
+There is no CI for this repository — releases are cut manually. After bumping `version.txt` and building (see [Build](#build) above), tag the commit and publish `dist/GEMDRIVE.BIN` and `dist/GEMDRIVE.IMG` as release assets, e.g.:
+
+```
+git tag vX.Y.Z && git push origin vX.Y.Z
+gh release create vX.Y.Z dist/GEMDRIVE.BIN dist/GEMDRIVE.IMG
+```
+
+See the [Releases page](https://github.com/RetroLoft/SideTNFS-Gemdrive/releases).
 
 ## Acknowledgements
 
