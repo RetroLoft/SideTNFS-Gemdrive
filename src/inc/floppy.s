@@ -66,6 +66,47 @@ Flopver equ 19
 SIDETNFS_FLOPPY_EMUL_OK equ 0   ; must match sidetnfs_floppy_emul_status_t's SIDETNFS_FLOPPY_EMUL_OK on the Pico side
 
 ; ---------------------------------------------------------------------
+; Disable/restore the Mega STE's 16MHz+cache around every ROM3 touch
+; below, mirroring gemdrive.s's own gemdrive_trap_megaste16 entry
+; sequence and restore_cpu_cache macro (see gemdrive.s:1157-1168,
+; :287-294). ROM3 is bus-snooped by the Pico in real time, not real
+; ROM -- ALL of it (this code's own instruction fetches, the
+; GEMDRVEMUL_FLOPPY_SESSION_* fields, and the OLD_HDV_*/OLD_XBIOS_VECTOR
+; chain-through addresses) is exposed to a stale Mega STE cache line if
+; the cache is left enabled, silently desyncing the protocol instead of
+; failing loudly. gemdrive.s's GEMDOS trap gets a MegaSTE-specific ENTRY
+; POINT chosen once at install time (see save_vectors), so its disable
+; needs no runtime hardware check; these hooks are the SAME code
+; regardless of machine, so the Mega STE check has to happen here, at
+; runtime, on every call -- the same check restore_cpu_cache already
+; does.
+;
+; d4 holds the saved register value for a routine's entire body. Chosen
+; because neither floppy_rwabs_emulated/floppy_xbios_rw's own local
+; register use (d0-d3/d5-d7/a0), nor floppy_read_one_sector's own
+; movem.l d1-d7/a1-a6 save/restore around each send_sync call, ever
+; touches d4 -- it survives untouched end to end. Every
+; disable_floppy_cache must be paired with exactly one
+; restore_floppy_cache on every exit path that follows it, and a
+; restore must always come AFTER the last ROM3 touch on that path, never
+; before (restoring early re-enables the cache for the very read it was
+; meant to protect).
+disable_floppy_cache    macro
+                    cmp.l #COOKIE_JAR_MEGASTE, (GEMDRVEMUL_SHARED_VARIABLES + SHARED_VARIABLE_HARDWARE_TYPE)
+                    bne.s .\@disable_floppy_cache_continue
+                    move.b MEGASTE_SPEED_CACHE_REG.w, d4        ; save the old value of cpu speed
+                    and.b #%00000001,MEGASTE_SPEED_CACHE_REG.w  ; disable MSTe cache
+.\@disable_floppy_cache_continue:
+                    endm
+
+restore_floppy_cache    macro
+                    cmp.l #COOKIE_JAR_MEGASTE, (GEMDRVEMUL_SHARED_VARIABLES + SHARED_VARIABLE_HARDWARE_TYPE)
+                    bne.s .\@restore_floppy_cache_continue
+                    move.b d4, MEGASTE_SPEED_CACHE_REG.w
+.\@restore_floppy_cache_continue:
+                    endm
+
+; ---------------------------------------------------------------------
 ; Installation -- called from rom_function, gated on
 ; GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY. Independent of, and unrelated
 ; to, GEMDRIVE's own GEMDOS-trap install below.
@@ -109,6 +150,8 @@ install_floppy_xbios_trap:
 ; pointer to the 9-word BPB record.
 ; ---------------------------------------------------------------------
 new_getbpb_routine:
+    disable_floppy_cache                 ; before ANY ROM3 touch below -- even the "not ours"
+                                          ; chain-through path reads a ROM3 field
     cmp.w   #0,4(sp)
     bne.s   .not_floppy_a
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
@@ -116,9 +159,12 @@ new_getbpb_routine:
     tst.l   GEMDRVEMUL_FLOPPY_SESSION_STATUS
     bne.s   .not_floppy_a                ; no validated image ready -- fall through, same as "not our drive"
     move.l  #GEMDRVEMUL_FLOPPY_SESSION_BPB,d0
+    restore_floppy_cache
     rts
 .not_floppy_a:
-    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB,-(sp)
+    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB,a1
+    restore_floppy_cache
+    move.l  a1,-(sp)
     rts
 
 ; ---------------------------------------------------------------------
@@ -137,22 +183,27 @@ new_getbpb_routine:
 ; disk switching. The ack round-trip only happens on the actual edge
 ; (once per real change), never on the steady-state "unchanged" path.
 new_mediach_routine:
+    disable_floppy_cache                 ; before ANY ROM3 touch below (same rationale as getbpb)
     cmp.w   #0,4(sp)
     bne.s   .mc_not_floppy_a
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
     beq.s   .mc_not_floppy_a
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED
     beq.s   .mc_unchanged
-    movem.l d1-d7/a1-a6,-(sp)
+    movem.l d1-d7/a1-a6,-(sp)            ; transparently preserves d4 (our saved cache value) too
     send_sync CMD_FLOPPY_MEDIA_CHANGE_ACK,0
     movem.l (sp)+,d1-d7/a1-a6
     moveq   #2,d0
+    restore_floppy_cache
     rts
 .mc_unchanged:
     moveq   #0,d0
+    restore_floppy_cache
     rts
 .mc_not_floppy_a:
-    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH,-(sp)
+    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH,a1
+    restore_floppy_cache
+    move.l  a1,-(sp)
     rts
 
 ; ---------------------------------------------------------------------
@@ -161,6 +212,9 @@ new_mediach_routine:
 ; error code.
 ; ---------------------------------------------------------------------
 new_rwabs_routine:
+    disable_floppy_cache                 ; before ANY ROM3 touch below (same rationale as getbpb) --
+                                          ; stays active across the bra into floppy_rwabs_emulated,
+                                          ; which restores it on every one of its own exits
     cmp.w   #0,14(sp)
     bne.s   .rw_not_floppy_a
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
@@ -169,7 +223,9 @@ new_rwabs_routine:
     bne.s   .rw_not_floppy_a
     bra     floppy_rwabs_emulated
 .rw_not_floppy_a:
-    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW,-(sp)
+    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW,a1
+    restore_floppy_cache
+    move.l  a1,-(sp)
     rts
 
 ; recno IS the logical sector number for Rwabs (no track/side/sector
@@ -187,6 +243,7 @@ floppy_rwabs_emulated:
     btst    #0,d5
     beq.s   .rw_read
     moveq   #EWRPRO,d0           ; write-protected -- no wire call at all
+    restore_floppy_cache
     rts
 
 .rw_read:
@@ -209,8 +266,10 @@ floppy_rwabs_emulated:
     addq.w  #1,d2
     dbf     d1,.rw_read_loop
     moveq   #0,d0
+    restore_floppy_cache
     rts
 .rw_read_error:
+    restore_floppy_cache
     rts                          ; d0 already holds the GEMDOS error code from floppy_read_one_sector
 
 NUM_BYTES_PER_SECTOR_ATARI equ 512
@@ -267,6 +326,8 @@ new_floppy_xbios_trap:
     beq.s   .fx_notlong
     addq.w  #2,a0
 .fx_notlong:
+    disable_floppy_cache          ; before ANY ROM3 touch below -- every path out of this trap,
+                                   ; matched or not, ends up reading a ROM3 field (see .fx_chain)
     cmp.w   #Floprd,6(a0)
     beq.s   .fx_floprd
     cmp.w   #Flopwr,6(a0)
@@ -274,9 +335,8 @@ new_floppy_xbios_trap:
     cmp.w   #Flopfmt,6(a0)
     beq.s   .fx_flopfmt
     cmp.w   #Flopver,6(a0)
-    beq.s   .fx_flopver
-    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR,-(sp)
-    rts
+    beq     .fx_flopver
+    bra     .fx_chain
 
 ; Floprd(buf,dummy,rwflag,dev,sect,track,side,count) -- a0 already points
 ; 6 bytes into the caller's own pushed args (past the trap opcode word +
@@ -284,50 +344,55 @@ new_floppy_xbios_trap:
 ; for -- see main new_XBIOS_trap_routine for the identical +6 convention).
 .fx_floprd:
     cmp.w   #0,16(a0)             ; dev
-    bne.s   .fx_chain
+    bne     .fx_chain
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
-    beq.s   .fx_chain
+    beq     .fx_chain
     tst.l   GEMDRVEMUL_FLOPPY_SESSION_STATUS
-    bne.s   .fx_chain
+    bne     .fx_chain
     bra     floppy_xbios_rw
 
 .fx_flopwr:
     cmp.w   #0,16(a0)
-    bne.s   .fx_chain
+    bne     .fx_chain
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
-    beq.s   .fx_chain
+    beq     .fx_chain
     tst.l   GEMDRVEMUL_FLOPPY_SESSION_STATUS
-    bne.s   .fx_chain
-    movem.l d1-d7/a1-a6,-(sp)
+    bne     .fx_chain
+    movem.l d1-d7/a1-a6,-(sp)      ; transparently preserves d4 (our saved cache value) too
     moveq   #EWRPRO,d0            ; read-only MVP: reject immediately, no wire call
     move.l  d0,8(a0)
     movem.l (sp)+,d1-d7/a1-a6
+    restore_floppy_cache
     rte
 
 .fx_flopfmt:
     cmp.w   #0,16(a0)
-    bne.s   .fx_chain
+    bne     .fx_chain
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
-    beq.s   .fx_chain
+    beq     .fx_chain
     movem.l d1-d7/a1-a6,-(sp)
     moveq   #ERR,d0               ; read-only MVP: format always fails, same as the original SidecarTridge driver's own precedent
     move.l  d0,8(a0)
     movem.l (sp)+,d1-d7/a1-a6
+    restore_floppy_cache
     rte
 
 .fx_flopver:
     cmp.w   #0,16(a0)
-    bne.s   .fx_chain
+    bne     .fx_chain
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
-    beq.s   .fx_chain
+    beq     .fx_chain
     movem.l d1-d7/a1-a6,-(sp)
     clr.l   d0                    ; always "verified successfully" -- same as the original SidecarTridge driver's own precedent, no real hardware to verify against
     move.l  d0,8(a0)
     movem.l (sp)+,d1-d7/a1-a6
+    restore_floppy_cache
     rte
 
 .fx_chain:
-    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR,-(sp)
+    move.l  GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR,a1
+    restore_floppy_cache
+    move.l  a1,-(sp)
     rts
 
 ; Floprd/Flopwr: translate track/side/sector to LBA and dispatch through
@@ -399,5 +464,6 @@ floppy_xbios_rw:
     move.l  d0,8(a0)
     lea     52(sp),sp
     movem.l (sp)+,d1-d7/a1-a6
+    restore_floppy_cache
     rte
 
