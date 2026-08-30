@@ -52,8 +52,9 @@ GEMDRVEMUL_FLOPPY_SESSION_BPB          equ (GEMDRVEMUL_FLOPPY_SESSION+1076) ; ui
 GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED equ (GEMDRVEMUL_FLOPPY_SESSION_BPB+18) ; uint16_t, plain word -- 0=unchanged, nonzero=report "definitely changed" once then ack it (Phase 4A)
 
 ; Command IDs (APP_GEMDRVEMUL << 8 | subcommand, matching commands.h)
-CMD_FLOPPY_READ_SECTOR       equ ($2A + APP_GEMDRVEMUL)  ; request: LBA, caller PC -- diagnostic-only,
-                                                          ; 0 if not tracked for the call path (8-byte payload,
+CMD_FLOPPY_READ_SECTOR       equ ($2A + APP_GEMDRVEMUL)  ; request: LBA, caller PC, original count --
+                                                          ; the last two are diagnostic-only, 0 if not
+                                                          ; tracked for the call path (12-byte payload,
                                                           ; was 4 bytes/LBA-only before hardware bring-up)
 CMD_FLOPPY_SAVE_VECTORS      equ ($2C + APP_GEMDRVEMUL)  ; request: old getbpb/rwabs/mediach vectors (12-byte payload -- a plain send_sync call cannot carry a fourth)
 CMD_FLOPPY_SAVE_XBIOS_VECTOR equ ($2D + APP_GEMDRVEMUL)  ; request: old XBIOS trap vector (4-byte payload) -- separate call, see commands.h's own comment
@@ -214,17 +215,38 @@ new_mediach_routine:
 ; error code.
 ; ---------------------------------------------------------------------
 new_rwabs_routine:
-; Diagnostic (hardware bring-up): capture the address hdv_rw was called
-; FROM, in a1, threaded through floppy_rwabs_emulated/floppy_read_one_sector
+; Diagnostic (hardware bring-up), corrected: the first version of this
+; capture read (sp) -- the return address of the JSR inside TOS's own
+; generic BIOS/XBIOS trap dispatcher that calls through hdv_rw. That
+; address (confirmed via a TOS 2.06 disassembly around old_xbios_vector,
+; captured earlier by SAVE_XBIOS_VECTOR) turned out to be the SAME for
+; every trap#13 Rwabs call system-wide, regardless of who ultimately
+; invoked trap#13 -- so it could never actually distinguish a TOS-internal
+; caller from the booted image's own loader. Useless for that purpose.
+;
+; The dispatcher builds its own private per-call frame before this JSR --
+; sysvar $4a2 holds a pointer to it, and the frame's first long is the
+; ORIGINAL trap-caller's own PC (the thing we actually want), copied there
+; from the real exception frame before the dispatcher's own register
+; save/restore and user/supervisor-mode handling consumes it. That
+; genuinely does distinguish GEMDOS/BIOS-internal callers (TOS ROM
+; addresses) from the booted image's own relocated loader code (typically
+; much lower). Threaded through floppy_rwabs_emulated/floppy_read_one_sector
 ; unchanged (transparently preserved by that routine's own movem.l
-; d1-d7/a1-a6) and appended to CMD_FLOPPY_READ_SECTOR's payload -- lets the
-; Pico-side trace tell a TOS-ROM-internal caller (e.g. BIOS's own Rwabs()
-; trap dispatcher, ~0xE0xxxx) apart from the booted image's own relocated
-; loader code (typically a much lower address) calling straight through
-; the vector. hdv_rw is always reached via a plain jsr, so (sp) at this
-; exact point -- before anything else runs -- is that caller's own return
-; address.
-    move.l  (sp),a1
+; d1-d7/a1-a6) and appended to CMD_FLOPPY_READ_SECTOR's payload, same as
+; before.
+    move.l  $4a2,a1
+    move.l  (a1),a1
+; Diagnostic (hardware bring-up): also capture the ORIGINAL count this
+; Rwabs call asked for (10(sp), read independently of floppy_rwabs_emulated's
+; own d1, which gets consumed/decremented as its loop counter and no longer
+; holds the original value partway through a multi-sector call) in d6,
+; threaded the same way as a1 above -- floppy_rwabs_emulated/floppy_read_one_
+; sector never use d6 for anything else. Lets the Pico-side trace tell
+; "one Rwabs call, count=N, starting near the FAT boundary" apart from "N
+; separate count=1 calls for the identical LBA" -- the former would point at
+; a bug in our own multi-sector loop rather than in whoever's calling us.
+    move.w  10(sp),d6
     disable_floppy_cache                 ; before ANY ROM3 touch below (same rationale as getbpb) --
                                           ; stays active across the bra into floppy_rwabs_emulated,
                                           ; which restores it on every one of its own exits
@@ -289,7 +311,9 @@ NUM_BYTES_PER_SECTOR_ATARI equ 512
 
 ; Reads exactly one 512-byte logical sector (d2 = LBA) into (a0). a1 = a
 ; diagnostic-only caller-PC value (see new_rwabs_routine/floppy_xbios_rw)
-; forwarded to the Pico as-is, 0 if not tracked for this call path.
+; forwarded to the Pico as-is, 0 if not tracked for this call path. d6 = a
+; diagnostic-only original-Rwabs/Floprd count value, forwarded the same way
+; (see new_rwabs_routine/floppy_xbios_rw's own .fxrw_do_read).
 ; Output: d0 = 0 (OK) or a negative GEMDOS error code. Note: a0 is
 ; CONSUMED as the copy-loop's destination pointer and comes back
 ; advanced past the 512 bytes just written, not preserved -- both callers
@@ -298,11 +322,15 @@ NUM_BYTES_PER_SECTOR_ATARI equ 512
 ; safe either way, but do not assume a0 survives a call unchanged. d2 is
 ; genuinely untouched.
 floppy_read_one_sector:
-    movem.l d1-d7/a1-a6,-(sp)     ; transparently preserves a1 (caller-PC) too
+    movem.l d1-d7/a1-a6,-(sp)     ; transparently preserves a1/d6 (diagnostics) too
     move.l  d2,d3                ; payload: LBA (4 bytes)
     move.l  a1,d4                 ; payload: caller PC, diagnostic-only (4 bytes) -- must
                                    ; read a1 here, before it's reused below
-    send_sync CMD_FLOPPY_READ_SECTOR,8
+    clr.l   d5
+    move.w  d6,d5                 ; payload: original count, diagnostic-only (4 bytes,
+                                   ; zero-extended from the word value in d6) -- must read
+                                   ; d6 here too, before it's reused below
+    send_sync CMD_FLOPPY_READ_SECTOR,12
     movem.l (sp)+,d1-d7/a1-a6
     tst.w   d0
     bne.s   .read_backend_error
@@ -463,6 +491,8 @@ floppy_xbios_rw:
     bra.s   .fxrw_done
 .fxrw_do_read:
     move.l  6(sp),a0
+    move.w  10(sp),d6            ; count diagnostic (see new_rwabs_routine) -- d6's last real
+                                  ; use here was the geometry math above, safe to reuse now
     move.w  10(sp),d1
     move.w  12(sp),d2
     subq.w  #1,d1
