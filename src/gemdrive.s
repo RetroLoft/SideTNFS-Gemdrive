@@ -6,6 +6,29 @@
 
 ; Bootstrap the code in ASM
 
+; PHYSICAL_HD_BOOT_SUPPRESSION (follow-up, not implemented in Phase 4):
+; the virtual floppy hooks in inc/floppy.s (getbpb.vector/rwabs.vector/
+; mediach.vector) make TOS's native diskboot->hdv_boot->_dskbuf sequence
+; boot the virtual A: image transparently, on every TOS version, without
+; touching hdv_boot at all -- confirmed against the actual TOS 1.04/1.06
+; (th-otto/tos1x) and TOS 2.06/3.06 (th-otto/tos3x) bios/startup.S
+; sources. What this does NOT do: TOS's dmaboot (a separate, unconditional
+; `bsr diskboot / bsr dmaboot` pair in both TOS generations, confirmed
+; identical in both source trees, no vector, no gating system variable)
+; still runs afterward and can still boot a real physical bootable
+; ACSI/SCSI/IDE disk's own driver, IF the virtual floppy's boot sector
+; returns normally to TOS instead of taking over the machine (a
+; boot-sector game that never returns is unaffected either way, since
+; dmaboot is never reached). No TOS-ROM-level, non-keyboard, non-
+; ROM-patching mechanism to suppress dmaboot was found (see this
+; project's own Phase 3D/3C research) -- the only real fix identified is
+; a TOS-version-specific continuation/boot trampoline (detect TOS
+; version, skip past the native diskboot+dmaboot call site entirely from
+; CA_INIT), deliberately deferred pending Hatari + real-hardware
+; verification across TOS versions before committing to per-version
+; hardcoded addresses. Track as a separate, explicit follow-up -- do not
+; fold into the floppy hooks above without that verification.
+
     XDEF   rom_function
 
     ifne _DEBUG
@@ -334,6 +357,22 @@ detect_emulated_file_handler   macro
         org $FA0040
     endif
 rom_function:
+; Phase 4: read the two independent boot-policy flags the Pico publishes
+; (GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE/_INSTALL_FLOPPY, see
+; inc/floppy.s's own top-of-file comment). Floppy hooks install first and
+; entirely independently -- they have no dependency on GEMDRIVE's own
+; WiFi/RTC/ping bring-up below, and must work with INSTALL_GEMDRIVE=NO
+; (the NO/YES clean-floppy-boot case). If INSTALL_GEMDRIVE=NO, skip the
+; rest of this function entirely -- no GEMDOS trap, no WiFi/RTC wait, no
+; drive table.
+    tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
+    beq.s   .rom_function_no_floppy
+    bsr     install_floppy_hooks
+.rom_function_no_floppy:
+    tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE
+    bne.s   .rom_function_gemdrive
+    rts
+.rom_function_gemdrive:
     print gemdrive_emulator_msg          ; Prints "...GEMDRIVE - v" and stops there (see note above)
 
 ; Print the ROM version digits at runtime (VERSION_MAJOR/MINOR/PATCH are
@@ -2179,6 +2218,7 @@ _notlong:
 ; Shared functions included at the end of the file
 ; Don't forget to include the macros for the shared functions at the top of file
     include "inc/sidecart_functions.s"
+    include "inc/floppy.s"
 
 
 
