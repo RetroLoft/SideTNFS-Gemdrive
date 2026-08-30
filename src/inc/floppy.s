@@ -52,7 +52,9 @@ GEMDRVEMUL_FLOPPY_SESSION_BPB          equ (GEMDRVEMUL_FLOPPY_SESSION+1076) ; ui
 GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED equ (GEMDRVEMUL_FLOPPY_SESSION_BPB+18) ; uint16_t, plain word -- 0=unchanged, nonzero=report "definitely changed" once then ack it (Phase 4A)
 
 ; Command IDs (APP_GEMDRVEMUL << 8 | subcommand, matching commands.h)
-CMD_FLOPPY_READ_SECTOR       equ ($2A + APP_GEMDRVEMUL)  ; request: LBA (4-byte payload)
+CMD_FLOPPY_READ_SECTOR       equ ($2A + APP_GEMDRVEMUL)  ; request: LBA, caller PC -- diagnostic-only,
+                                                          ; 0 if not tracked for the call path (8-byte payload,
+                                                          ; was 4 bytes/LBA-only before hardware bring-up)
 CMD_FLOPPY_SAVE_VECTORS      equ ($2C + APP_GEMDRVEMUL)  ; request: old getbpb/rwabs/mediach vectors (12-byte payload -- a plain send_sync call cannot carry a fourth)
 CMD_FLOPPY_SAVE_XBIOS_VECTOR equ ($2D + APP_GEMDRVEMUL)  ; request: old XBIOS trap vector (4-byte payload) -- separate call, see commands.h's own comment
 CMD_FLOPPY_MEDIA_CHANGE_ACK  equ ($2E + APP_GEMDRVEMUL)  ; zero payload -- clears GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED back to 0
@@ -212,6 +214,17 @@ new_mediach_routine:
 ; error code.
 ; ---------------------------------------------------------------------
 new_rwabs_routine:
+; Diagnostic (hardware bring-up): capture the address hdv_rw was called
+; FROM, in a1, threaded through floppy_rwabs_emulated/floppy_read_one_sector
+; unchanged (transparently preserved by that routine's own movem.l
+; d1-d7/a1-a6) and appended to CMD_FLOPPY_READ_SECTOR's payload -- lets the
+; Pico-side trace tell a TOS-ROM-internal caller (e.g. BIOS's own Rwabs()
+; trap dispatcher, ~0xE0xxxx) apart from the booted image's own relocated
+; loader code (typically a much lower address) calling straight through
+; the vector. hdv_rw is always reached via a plain jsr, so (sp) at this
+; exact point -- before anything else runs -- is that caller's own return
+; address.
+    move.l  (sp),a1
     disable_floppy_cache                 ; before ANY ROM3 touch below (same rationale as getbpb) --
                                           ; stays active across the bra into floppy_rwabs_emulated,
                                           ; which restores it on every one of its own exits
@@ -274,7 +287,9 @@ floppy_rwabs_emulated:
 
 NUM_BYTES_PER_SECTOR_ATARI equ 512
 
-; Reads exactly one 512-byte logical sector (d2 = LBA) into (a0).
+; Reads exactly one 512-byte logical sector (d2 = LBA) into (a0). a1 = a
+; diagnostic-only caller-PC value (see new_rwabs_routine/floppy_xbios_rw)
+; forwarded to the Pico as-is, 0 if not tracked for this call path.
 ; Output: d0 = 0 (OK) or a negative GEMDOS error code. Note: a0 is
 ; CONSUMED as the copy-loop's destination pointer and comes back
 ; advanced past the 512 bytes just written, not preserved -- both callers
@@ -283,9 +298,11 @@ NUM_BYTES_PER_SECTOR_ATARI equ 512
 ; safe either way, but do not assume a0 survives a call unchanged. d2 is
 ; genuinely untouched.
 floppy_read_one_sector:
-    movem.l d1-d7/a1-a6,-(sp)
+    movem.l d1-d7/a1-a6,-(sp)     ; transparently preserves a1 (caller-PC) too
     move.l  d2,d3                ; payload: LBA (4 bytes)
-    send_sync CMD_FLOPPY_READ_SECTOR,4
+    move.l  a1,d4                 ; payload: caller PC, diagnostic-only (4 bytes) -- must
+                                   ; read a1 here, before it's reused below
+    send_sync CMD_FLOPPY_READ_SECTOR,8
     movem.l (sp)+,d1-d7/a1-a6
     tst.w   d0
     bne.s   .read_backend_error
@@ -406,6 +423,9 @@ new_floppy_xbios_trap:
 ; (sector-1) -- identical to req #2's own formula.
 floppy_xbios_rw:
     movem.l d1-d7/a1-a6,-(sp)
+    suba.l  a1,a1                        ; caller-PC diagnostic (see new_rwabs_routine) not wired up
+                                          ; for this XBIOS path yet -- 0 is the "not tracked" sentinel
+                                          ; floppy_read_one_sector sends through unchanged
     lea     -52(sp),sp
     addq.l  #6,a0
     move.l  2(a0),6(sp)                  ; buffer
