@@ -59,6 +59,17 @@ CMD_FLOPPY_READ_SECTOR       equ ($2A + APP_GEMDRVEMUL)  ; request: LBA, caller 
 CMD_FLOPPY_SAVE_VECTORS      equ ($2C + APP_GEMDRVEMUL)  ; request: old getbpb/rwabs/mediach vectors (12-byte payload -- a plain send_sync call cannot carry a fourth)
 CMD_FLOPPY_SAVE_XBIOS_VECTOR equ ($2D + APP_GEMDRVEMUL)  ; request: old XBIOS trap vector (4-byte payload) -- separate call, see commands.h's own comment
 CMD_FLOPPY_MEDIA_CHANGE_ACK  equ ($2E + APP_GEMDRVEMUL)  ; zero payload -- clears GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED back to 0
+CMD_FLOPPY_GETBPB_PING       equ ($2F + APP_GEMDRVEMUL)  ; zero payload, diagnostic-only (hardware bring-up) --
+                                                          ; makes new_getbpb_routine's own call frequency visible
+                                                          ; on the Pico side; otherwise a pure local ROM3 read,
+                                                          ; invisible in any trace. Fires only on the "disk_number
+                                                          ; 0, floppy active, image ready" success path.
+CMD_FLOPPY_MEDIACH_PING      equ ($30 + APP_GEMDRVEMUL)  ; zero payload, diagnostic-only, same rationale as
+                                                          ; CMD_FLOPPY_GETBPB_PING -- fires on new_mediach_routine's
+                                                          ; steady-state "unchanged" path specifically (the
+                                                          ; "changed" path already has wire visibility via
+                                                          ; CMD_FLOPPY_MEDIA_CHANGE_ACK). Likely the higher-
+                                                          ; frequency of the two new pings -- see call site comment.
 
 ; Flopver = 19 decimal (0x13), NOT 13 decimal -- 13 decimal is Mfpint.
 ; Phase 4A correction: the original SidecarTridge driver's own floppy.s
@@ -161,6 +172,14 @@ new_getbpb_routine:
     beq.s   .not_floppy_a
     tst.l   GEMDRVEMUL_FLOPPY_SESSION_STATUS
     bne.s   .not_floppy_a                ; no validated image ready -- fall through, same as "not our drive"
+; Diagnostic (hardware bring-up): Getbpb is otherwise a pure local ROM3
+; read, invisible in any Pico-side trace -- ping so its call frequency is
+; visible. Bring-up only, intended for removal once the current bug is
+; found; do the ping before setting d0 so send_sync's own return status
+; doesn't need saving.
+    movem.l d1-d7/a1-a6,-(sp)            ; transparently preserves d4 (our saved cache value) too
+    send_sync CMD_FLOPPY_GETBPB_PING,0
+    movem.l (sp)+,d1-d7/a1-a6
     move.l  #GEMDRVEMUL_FLOPPY_SESSION_BPB,d0
     restore_floppy_cache
     rts
@@ -200,6 +219,15 @@ new_mediach_routine:
     restore_floppy_cache
     rts
 .mc_unchanged:
+; Diagnostic (hardware bring-up): the steady-state path, otherwise a pure
+; local ROM3 read with zero wire visibility -- unlike the "changed" branch
+; above, which already round-trips via CMD_FLOPPY_MEDIA_CHANGE_ACK. This is
+; almost certainly the higher-frequency of the two new pings (mediach is
+; commonly polled before every disk op by convention); bring-up only,
+; intended for removal once the current bug is found.
+    movem.l d1-d7/a1-a6,-(sp)
+    send_sync CMD_FLOPPY_MEDIACH_PING,0
+    movem.l (sp)+,d1-d7/a1-a6
     moveq   #0,d0
     restore_floppy_cache
     rts
@@ -322,7 +350,19 @@ NUM_BYTES_PER_SECTOR_ATARI equ 512
 ; safe either way, but do not assume a0 survives a call unchanged. d2 is
 ; genuinely untouched.
 floppy_read_one_sector:
-    movem.l d1-d7/a1-a6,-(sp)     ; transparently preserves a1/d6 (diagnostics) too
+; Bug fix (hardware bring-up): send_sync_command_to_sidecart documents its
+; own clobber list as "d1-d7 modified, a0-a3 modified" (sidecart_functions.s
+; header comments) -- a0 was NOT in this routine's save/restore set, so the
+; caller's destination buffer pointer (passed in a0) was being silently
+; replaced by send_sync's own internal ROM3_START_ADDR scratch value. The
+; copy loop below then wrote the sector into ROM3/ROM4 space instead of the
+; caller's real ST-RAM buffer -- a guaranteed bus error ("two bombs") on
+; real hardware, on literally the first real read after Getbpb/Mediach
+; handshaking succeeds. Matches every hardware trace gathered: the wire
+; protocol always completes cleanly (Pico reports rc=OK), and the crash
+; happens purely on the 68000 side afterward, during this local copy --
+; invisible to any Pico-side trace, which is exactly what we saw.
+    movem.l d1-d7/a0-a6,-(sp)     ; transparently preserves a1/d6 (diagnostics) too
     move.l  d2,d3                ; payload: LBA (4 bytes)
     move.l  a1,d4                 ; payload: caller PC, diagnostic-only (4 bytes) -- must
                                    ; read a1 here, before it's reused below
@@ -331,7 +371,7 @@ floppy_read_one_sector:
                                    ; zero-extended from the word value in d6) -- must read
                                    ; d6 here too, before it's reused below
     send_sync CMD_FLOPPY_READ_SECTOR,12
-    movem.l (sp)+,d1-d7/a1-a6
+    movem.l (sp)+,d1-d7/a0-a6
     tst.w   d0
     bne.s   .read_backend_error
     tst.l   GEMDRVEMUL_FLOPPY_SESSION_STATUS
