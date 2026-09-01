@@ -37,6 +37,10 @@ GEMDRVEMUL_FLOPPY_SESSION_STATUS       equ (GEMDRVEMUL_FLOPPY_SESSION+0)   ; uin
 GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT  equ (GEMDRVEMUL_FLOPPY_SESSION+8)   ; uint32_t, swapped long
 GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE equ (GEMDRVEMUL_FLOPPY_SESSION+12) ; uint16_t, plain word
 GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY   equ (GEMDRVEMUL_FLOPPY_SESSION+14) ; uint16_t, plain word
+; +16/+18 (RESET_REQUESTED/EXIT_ACK_SEEN) are reserved/unused on the Pico
+; side -- were for an automatic-reset design (Phase 6B) that's been
+; abandoned in favor of a manual Atari RESET after leaving floppy mode.
+; No equates here since nothing in this file references them.
 GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH   equ (GEMDRVEMUL_FLOPPY_SESSION+20)  ; char[512]
 GEMDRVEMUL_FLOPPY_SESSION_SIDES        equ (GEMDRVEMUL_FLOPPY_SESSION+532) ; uint16_t, plain word
 GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK equ (GEMDRVEMUL_FLOPPY_SESSION+534) ; uint16_t, plain word
