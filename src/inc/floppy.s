@@ -32,28 +32,68 @@
 ; not offsets, so every use site below is a plain reference (no ".w"
 ; suffix, which would be wrong anyway: absolute-short addressing only
 ; covers -32768..32767, and these addresses are far larger).
-GEMDRVEMUL_FLOPPY_SESSION              equ (ROM3_START_ADDR+39168)
+GEMDRVEMUL_FLOPPY_SESSION              equ (ROM3_START_ADDR+38864) ; was +39168 -- the mixed-source
+                                                                    ; Favorites/Carousel redesign changed
+                                                                    ; the FAVORITES table/strings size
+                                                                    ; upstream of this block's own base
+                                                                    ; (GEMDRVEMUL_FLOPPY_SESSION is computed
+                                                                    ; from GEMDRVEMUL_FLOPPY_FAVORITES_STRINGS
+                                                                    ; in gemdrvemul.h, not a fixed constant),
+                                                                    ; shifting this base by -304 bytes too --
+                                                                    ; a SEPARATE bug from the internal field
+                                                                    ; offsets fixed above. Re-verified by
+                                                                    ; actually compiling a probe translation
+                                                                    ; unit against the real, current
+                                                                    ; gemdrvemul.h with the exact same
+                                                                    ; arm-none-eabi-gcc flags/include paths
+                                                                    ; the firmware's own CMake build uses
+                                                                    ; (not hand-arithmetic) -- see the
+                                                                    ; message thread with the firmware
+                                                                    ; session for the full derivation.
 GEMDRVEMUL_FLOPPY_SESSION_STATUS       equ (GEMDRVEMUL_FLOPPY_SESSION+0)   ; uint32_t, swapped long
-GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT  equ (GEMDRVEMUL_FLOPPY_SESSION+8)   ; uint32_t, swapped long
-GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE equ (GEMDRVEMUL_FLOPPY_SESSION+12) ; uint16_t, plain word
-GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY   equ (GEMDRVEMUL_FLOPPY_SESSION+14) ; uint16_t, plain word
-; +16/+18 (RESET_REQUESTED/EXIT_ACK_SEEN) are reserved/unused on the Pico
-; side -- were for an automatic-reset design (Phase 6B) that's been
-; abandoned in favor of a manual Atari RESET after leaving floppy mode.
-; No equates here since nothing in this file references them.
-GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH   equ (GEMDRVEMUL_FLOPPY_SESSION+20)  ; char[512]
-GEMDRVEMUL_FLOPPY_SESSION_SIDES        equ (GEMDRVEMUL_FLOPPY_SESSION+532) ; uint16_t, plain word
-GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK equ (GEMDRVEMUL_FLOPPY_SESSION+534) ; uint16_t, plain word
-GEMDRVEMUL_FLOPPY_SESSION_TRACKS       equ (GEMDRVEMUL_FLOPPY_SESSION+536) ; uint16_t, plain word
-GEMDRVEMUL_FLOPPY_SESSION_BYTES_PER_SECTOR equ (GEMDRVEMUL_FLOPPY_SESSION+538) ; uint16_t, plain word
-GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA   equ (GEMDRVEMUL_FLOPPY_SESSION+544) ; uint32_t, swapped long -- response echo only, see gemdrvemul.h
-GEMDRVEMUL_FLOPPY_SESSION_SECTOR_DATA  equ (GEMDRVEMUL_FLOPPY_SESSION+548) ; uint8_t[512]
-GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB     equ (GEMDRVEMUL_FLOPPY_SESSION+1060) ; uint32_t, swapped long
-GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW      equ (GEMDRVEMUL_FLOPPY_SESSION+1064) ; uint32_t, swapped long
-GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH equ (GEMDRVEMUL_FLOPPY_SESSION+1068) ; uint32_t, swapped long
-GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR equ (GEMDRVEMUL_FLOPPY_SESSION+1072) ; uint32_t, swapped long -- floppy's OWN XBIOS chain-through value, separate from GEMDRIVE's own GEMDRVEMUL_OLD_XBIOS slot (no collision: each installer only ever touches its own field)
-GEMDRVEMUL_FLOPPY_SESSION_BPB          equ (GEMDRVEMUL_FLOPPY_SESSION+1076) ; uint16_t[9] -- recsize,clsiz,clsizb,rdlen,fsiz,fatrec,datrec,numcl,bflags
-GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED equ (GEMDRVEMUL_FLOPPY_SESSION_BPB+18) ; uint16_t, plain word -- 0=unchanged, nonzero=report "definitely changed" once then ack it (Phase 4A)
+GEMDRVEMUL_FLOPPY_SESSION_GENERATION   equ (GEMDRVEMUL_FLOPPY_SESSION+4)   ; uint32_t, swapped long -- bumped by
+                                                                           ; SESSION_START, lets a stale
+                                                                           ; READ_SECTOR response be detected.
+                                                                           ; Not currently read anywhere in this
+                                                                           ; file (SECTOR_LBA's own echo already
+                                                                           ; covers the desync check floppy.s
+                                                                           ; needs) -- defined for completeness/
+                                                                           ; future use, matching gemdrvemul.h.
+; The mixed-source Favorites/Carousel redesign (2026-09) removed
+; GEMDRVEMUL_FLOPPY_SESSION_ACTIVE_SLOT entirely (which of the 8
+; TNFS/SD source profiles was active -- superseded by each Favorites
+; entry carrying its own backend+host+port+path) and inserted
+; CURRENT_FAVORITE/RESERVED2 further down (see below) -- every field
+; after ACTIVE_SLOT's old +8 slot shifted by -4 as a result. Re-verified
+; directly against romemul/include/gemdrvemul.h (not hand-arithmetic)
+; after this shift caused a real four-bombs-at-boot regression the
+; first time it was missed.
+GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE equ (GEMDRVEMUL_FLOPPY_SESSION+8) ; uint16_t, plain word (was +12)
+GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY   equ (GEMDRVEMUL_FLOPPY_SESSION+10) ; uint16_t, plain word (was +14)
+; +12/+14 (RESET_REQUESTED/EXIT_ACK_SEEN, was +16/+18) are reserved/
+; unused on the Pico side -- were for an automatic-reset design
+; (Phase 6B) that's been abandoned in favor of a manual Atari RESET
+; after leaving floppy mode. No equates here since nothing in this file
+; references them.
+GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH   equ (GEMDRVEMUL_FLOPPY_SESSION+16)  ; char[512] (was +20)
+GEMDRVEMUL_FLOPPY_SESSION_SIDES        equ (GEMDRVEMUL_FLOPPY_SESSION+528) ; uint16_t, plain word (was +532)
+GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK equ (GEMDRVEMUL_FLOPPY_SESSION+530) ; uint16_t, plain word (was +534)
+GEMDRVEMUL_FLOPPY_SESSION_TRACKS       equ (GEMDRVEMUL_FLOPPY_SESSION+532) ; uint16_t, plain word (was +536)
+GEMDRVEMUL_FLOPPY_SESSION_BYTES_PER_SECTOR equ (GEMDRVEMUL_FLOPPY_SESSION+534) ; uint16_t, plain word (was +538)
+; +536/+538 (CURRENT_FAVORITE/RESERVED2) are new Pico-side-only fields
+; from the same redesign -- CURRENT_FAVORITE (index into the FAVORITES
+; table) drives short-SELECT switching entirely on the Pico side, same
+; as ACTIVE_SLOT before it; RESERVED2 is pure alignment padding keeping
+; SECTOR_LBA 4-byte aligned. No equates here, same rationale as
+; RESET_REQUESTED/EXIT_ACK_SEEN above.
+GEMDRVEMUL_FLOPPY_SESSION_SECTOR_LBA   equ (GEMDRVEMUL_FLOPPY_SESSION+540) ; uint32_t, swapped long -- response echo only, see gemdrvemul.h (was +544)
+GEMDRVEMUL_FLOPPY_SESSION_SECTOR_DATA  equ (GEMDRVEMUL_FLOPPY_SESSION+544) ; uint8_t[512] (was +548)
+GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_BPB     equ (GEMDRVEMUL_FLOPPY_SESSION+1056) ; uint32_t, swapped long (was +1060)
+GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_RW      equ (GEMDRVEMUL_FLOPPY_SESSION+1060) ; uint32_t, swapped long (was +1064)
+GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_MEDIACH equ (GEMDRVEMUL_FLOPPY_SESSION+1064) ; uint32_t, swapped long (was +1068)
+GEMDRVEMUL_FLOPPY_SESSION_OLD_XBIOS_VECTOR equ (GEMDRVEMUL_FLOPPY_SESSION+1068) ; uint32_t, swapped long -- floppy's OWN XBIOS chain-through value, separate from GEMDRIVE's own GEMDRVEMUL_OLD_XBIOS slot (no collision: each installer only ever touches its own field) (was +1072)
+GEMDRVEMUL_FLOPPY_SESSION_BPB          equ (GEMDRVEMUL_FLOPPY_SESSION+1072) ; uint16_t[9] -- recsize,clsiz,clsizb,rdlen,fsiz,fatrec,datrec,numcl,bflags (was +1076)
+GEMDRVEMUL_FLOPPY_SESSION_MEDIA_CHANGED equ (GEMDRVEMUL_FLOPPY_SESSION_BPB+18) ; uint16_t, plain word -- 0=unchanged, nonzero=report "definitely changed" once then ack it (Phase 4A) -- formula unchanged, resolves to +1090 (was +1094)
 
 ; Command IDs (APP_GEMDRVEMUL << 8 | subcommand, matching commands.h)
 CMD_FLOPPY_READ_SECTOR       equ ($2A + APP_GEMDRVEMUL)  ; request: LBA, caller PC, original count --
