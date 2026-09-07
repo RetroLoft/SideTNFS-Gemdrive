@@ -6,6 +6,8 @@
 
 GEMDRIVE is the 68000 assembly ROM that turns a SideTNFS Raspberry Pi Pico cartridge into a **GEMDOS hard-disk emulator** for the Atari ST family. It's what makes drives like `C:`, `N:`, or the read-only Settings disk `S:` show up as ordinary GEMDOS drives at all — every `Fopen`, `Fread`, `Dsetpath`, directory listing, and so on that an Atari program issues against one of those drives is intercepted here and relayed to the Pico over the cartridge's own ROM3 bus, which then serves it from whichever backend that drive is configured for (a TNFS network share, a microSD card, or the built-in Settings disk). Any unmodified GEMDOS software just sees a hard disk.
 
+Independently of that, GEMDRIVE also emulates a read-only **virtual floppy drive** — `A:` or `B:`, an exclusive choice made in [SideTNFS-Floppy-browser](https://github.com/RetroLoft/SideTNFS-Floppy-browser)'s `FLOPPY.PRG` — by intercepting the BIOS `getbpb`/`rwabs`/`mediach` vectors and the XBIOS `Floprd`/`Flopwr`/`Flopfmt`/`Flopver` traps, serving sectors from whatever disk image `FLOPPY.PRG` has mounted, again over the cartridge's own ROM3 bus. This installs independently of the GEMDOS driver above (either, both, or neither can be active at boot, controlled by two separate Pico-published flags), so a clean floppy-only boot needs no GEMDOS involvement at all.
+
 This is a different kind of component from [SideTNFS-Config](https://github.com/RetroLoft/SideTNFS-Config): that repository builds `SIDETNFS.PRG`, an ordinary GEM application you launch from the desktop to *configure* drives. This repository builds the driver that makes configured drives *work* in the first place, and it runs automatically at boot — there is nothing to launch.
 
 The source in `src/` is split into:
@@ -13,7 +15,7 @@ The source in `src/` is split into:
 - **`gemdrive.s`** — the driver itself: the GEMDOS hard-disk emulation logic and the calls to the Multi-device over the cartridge bus.
 - **`main.s`** — the bootstrap ROM: a standard SidecarTridge cartridge header (magic number `$abcdef42` at `$FA0000`, name, timestamp, entry point, ...) that embeds the driver and starts it after GEMDOS init, before the Atari boots from disk. This is what actually gets linked into `GEMDRIVE.BIN`.
 - **`gemdrive_prg.s`** — a normal GEMDOS `.PRG` wrapper around the same driver, used only to test the driver's logic in an emulator (e.g. Hatari) without needing real SidecarTridge hardware. See [Testing without hardware](#testing-without-hardware) below.
-- **`inc/`** — shared TOS constants, SidecarTridge hardware macros (`send_sync` and friends, for talking to the Multi-device), and debug helpers (Hatari Natfeats logging) used by the files above.
+- **`inc/`** — shared TOS constants, SidecarTridge hardware macros (`send_sync` and friends, for talking to the Multi-device), and debug helpers (Hatari Natfeats logging) used by the files above, plus `floppy.s` — the virtual floppy `A:`/`B:` driver described above, installed independently of the GEMDOS driver.
 
 **A cartridge ROM image, not a `.PRG`:** building `main.s` + `gemdrive.s` produces `GEMDRIVE.BIN`, a raw 68000 ROM binary (linked with vlink's `-brawbin1` format) containing the cartridge header and driver code back to back. It is not a GEMDOS executable and can't be copied to a disk and run — it only makes sense mapped into the Pico's cartridge-ROM emulation address space, which is exactly what `SideTNFS-Firmware` does with it.
 
