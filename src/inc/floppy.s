@@ -3,7 +3,8 @@
 ; High-level BIOS/XBIOS sector interception, same proven model the
 ; original SidecarTridge floppy emulator used (getbpb.vector/rwabs.vector/
 ; mediach.vector + XBIOS Floprd/Flopwr/Flopfmt/Flopver) -- NOT WD1772/FDC
-; register emulation. Drive A: (disk_number 0) only, read-only. Does NOT
+; register emulation. Drive A: or B: (GEMDRVEMUL_FLOPPY_SESSION_DRIVE_
+; NUMBER, exclusive choice, default A:) only, read-only. Does NOT
 ; hook hdv_boot (getbpb.vector/rwabs.vector interception alone already
 ; makes TOS's own native boot-sector read see the virtual image
 ; transparently -- see Phase 3D/3C's own research; this is exactly how
@@ -70,11 +71,15 @@ GEMDRVEMUL_FLOPPY_SESSION_GENERATION   equ (GEMDRVEMUL_FLOPPY_SESSION+4)   ; uin
 ; first time it was missed.
 GEMDRVEMUL_FLOPPY_SESSION_INSTALL_GEMDRIVE equ (GEMDRVEMUL_FLOPPY_SESSION+8) ; uint16_t, plain word (was +12)
 GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY   equ (GEMDRVEMUL_FLOPPY_SESSION+10) ; uint16_t, plain word (was +14)
-; +12/+14 (RESET_REQUESTED/EXIT_ACK_SEEN, was +16/+18) are reserved/
-; unused on the Pico side -- were for an automatic-reset design
-; (Phase 6B) that's been abandoned in favor of a manual Atari RESET
-; after leaving floppy mode. No equates here since nothing in this file
-; references them.
+; A:/B: drive-select feature reclaimed the old RESET_REQUESTED slot
+; (same +12 offset) for DRIVE_NUMBER -- which physical unit INSTALL_
+; FLOPPY emulates, exclusive choice, default A: (0), FLOPPY.PRG's
+; Carousel Start dialog sets B: (1) explicitly via SESSION_START. +14
+; (EXIT_ACK_SEEN) is still reserved/unused on the Pico side -- was for
+; an automatic-reset design (Phase 6B) abandoned in favor of a manual
+; Atari RESET after leaving floppy mode -- no equate here since nothing
+; in this file references it.
+GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER equ (GEMDRVEMUL_FLOPPY_SESSION+12) ; uint16_t, plain word -- 0=drive A:/1=drive B:
 GEMDRVEMUL_FLOPPY_SESSION_IMAGE_PATH   equ (GEMDRVEMUL_FLOPPY_SESSION+16)  ; char[512] (was +20)
 GEMDRVEMUL_FLOPPY_SESSION_SIDES        equ (GEMDRVEMUL_FLOPPY_SESSION+528) ; uint16_t, plain word (was +532)
 GEMDRVEMUL_FLOPPY_SESSION_SECTORS_PER_TRACK equ (GEMDRVEMUL_FLOPPY_SESSION+530) ; uint16_t, plain word (was +534)
@@ -174,7 +179,7 @@ install_floppy_hooks:
     ; once (ROM4 is not Atari-writable, same constraint the GEMDOS-trap
     ; install already works around, see GEMDRVEMUL_FLOPPY_SESSION_OLD_HDV_*'s
     ; own comment in gemdrvemul.h), then read back with a fast local ROM3
-    ; load on every "not disk_number 0" fall-through.
+    ; load on every "not our emulated drive" fall-through.
     move.l  getbpb.vector.w,d3
     move.l  rwabs.vector.w,d4
     move.l  mediach.vector.w,d5
@@ -210,7 +215,9 @@ install_floppy_xbios_trap:
 new_getbpb_routine:
     disable_floppy_cache                 ; before ANY ROM3 touch below -- even the "not ours"
                                           ; chain-through path reads a ROM3 field
-    cmp.w   #0,4(sp)
+    move.w  GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER,d0 ; d0 free until the match path's own
+                                                       ; move.l #GEMDRVEMUL_FLOPPY_SESSION_BPB,d0 below
+    cmp.w   4(sp),d0
     bne.s   .not_floppy_a
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
     beq.s   .not_floppy_a
@@ -250,7 +257,8 @@ new_getbpb_routine:
 ; (once per real change), never on the steady-state "unchanged" path.
 new_mediach_routine:
     disable_floppy_cache                 ; before ANY ROM3 touch below (same rationale as getbpb)
-    cmp.w   #0,4(sp)
+    move.w  GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER,d0 ; d0 free until the moveq #2/#0,d0 further down
+    cmp.w   4(sp),d0
     bne.s   .mc_not_floppy_a
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
     beq.s   .mc_not_floppy_a
@@ -322,7 +330,8 @@ new_rwabs_routine:
     disable_floppy_cache                 ; before ANY ROM3 touch below (same rationale as getbpb) --
                                           ; stays active across the bra into floppy_rwabs_emulated,
                                           ; which restores it on every one of its own exits
-    cmp.w   #0,14(sp)
+    move.w  GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER,d0 ; d0 free -- caller-PC/count already in a1/d6
+    cmp.w   14(sp),d0
     bne.s   .rw_not_floppy_a
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
     beq.s   .rw_not_floppy_a
@@ -436,7 +445,8 @@ floppy_read_one_sector:
 
 ; ---------------------------------------------------------------------
 ; XBIOS trap extension -- Floprd(8)/Flopwr(9)/Flopfmt(10)/Flopver(19),
-; drive A: (Atari XBIOS drive number 0) only. Same reentry-lock discipline
+; drive A: or B: (GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER, exclusive
+; choice, default A:) only. Same reentry-lock discipline
 ; as GEMDRIVE's own new_XBIOS_trap_routine is not needed here: this trap
 ; never calls back into GEMDOS/another trap, so there is no reentrancy
 ; hazard to guard against.
@@ -472,7 +482,8 @@ new_floppy_xbios_trap:
 ; return info the same way GEMDRIVE's own XBIOS chain already accounts
 ; for -- see main new_XBIOS_trap_routine for the identical +6 convention).
 .fx_floprd:
-    cmp.w   #0,16(a0)             ; dev
+    move.w  GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER,d0 ; d0 free until this handler's own moveq/clr below
+    cmp.w   16(a0),d0             ; dev
     bne     .fx_chain
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
     beq     .fx_chain
@@ -481,7 +492,8 @@ new_floppy_xbios_trap:
     bra     floppy_xbios_rw
 
 .fx_flopwr:
-    cmp.w   #0,16(a0)
+    move.w  GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER,d0 ; d0 free until this handler's own moveq below
+    cmp.w   16(a0),d0
     bne     .fx_chain
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
     beq     .fx_chain
@@ -495,7 +507,8 @@ new_floppy_xbios_trap:
     rte
 
 .fx_flopfmt:
-    cmp.w   #0,16(a0)
+    move.w  GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER,d0 ; d0 free until this handler's own moveq below
+    cmp.w   16(a0),d0
     bne     .fx_chain
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
     beq     .fx_chain
@@ -507,7 +520,8 @@ new_floppy_xbios_trap:
     rte
 
 .fx_flopver:
-    cmp.w   #0,16(a0)
+    move.w  GEMDRVEMUL_FLOPPY_SESSION_DRIVE_NUMBER,d0 ; d0 free until this handler's own clr.l below
+    cmp.w   16(a0),d0
     bne     .fx_chain
     tst.w   GEMDRVEMUL_FLOPPY_SESSION_INSTALL_FLOPPY
     beq     .fx_chain
