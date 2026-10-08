@@ -57,3 +57,8 @@ dist/
 test/
 
 secrets.sh
+
+/build/falcon/
+/build/upstream-check/
+/dist/native/
+/dist/falcon/

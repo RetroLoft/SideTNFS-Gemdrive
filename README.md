@@ -120,3 +120,7 @@ This repository is a continuation of Diego Parrilla's original [`atarist-sidecar
 ## License
 
 The project is licensed under the GNU General Public License v3.0. The full license is accessible in the [LICENSE](LICENSE) file.
+
+## Native F36/F37 integration candidate
+
+See [the coordinated submission notes](docs/F36-UPSTREAM.md) for scope, companion repositories, build requirements and hardware validation limits.

@@ -1,0 +1,8 @@
+{
+  "upstream_url": "https://github.com/RetroLoft/SideTNFS-Gemdrive.git",
+  "upstream_commit": "6fca62c2f9ec4c367a5b7f24ce9029328bcc0d15",
+  "tested_r16_commit": "bfc6719576c6f25d272d4114c66050bddca0c09f",
+  "integration_branch": "falcon/native-integration",
+  "common_ancestor": "d0580007988ca3266ed099c10903ca213619916f",
+  "status": "F17 native guest port compiled; ROM and resident executable identical to R16; upstream ST release build passes; hardware validation pending"
+}

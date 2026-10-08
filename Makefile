@@ -7,3 +7,7 @@ else
 include Makefile.tos
 endif
 endif
+
+.PHONY: falcon
+falcon:
+	python3 tools/build_native.py
