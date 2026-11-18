@@ -460,6 +460,7 @@ new_floppy_xbios_trap:
 .fx_user_mode:
     move.l  usp,a0
     subq.l  #6,a0
+    bra.s   .fx_notlong     ; the arguments are on the user stack: no exception frame, no long-frame correction
 .fx_check_cpu:
     tst.w   _longframe
     beq.s   .fx_notlong

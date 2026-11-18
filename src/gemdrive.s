@@ -343,7 +343,7 @@ detect_emulated_drive_letter   macro
 
 ; Check if the file handler is of the SidecarT or not.
 detect_emulated_file_handler   macro
-                        and.l #$FFFF, d3                     ; Mask the upper word of the file handle
+                        ext.l d3                             ; Sign-extend the handle: device handles (CON: = -1, ...) stay negative
                         cmp.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_FIRST_FILE_DESCRIPTOR * 4)), d3 ; Check if the file handle in the range
                         blt .exec_old_handler                ; If less than, exec_old_handler the code. Otherwise continue with the code
                         endm
@@ -787,6 +787,7 @@ _xbios_not_user_mode:
 _xbios_user_mode:
     move.l usp,a0                    ; if user mode, correct stack pointer
     subq.l #6,a0
+    bra.s _xbios_notlong             ; the arguments are on the user stack: no exception frame, no long-frame correction
 ;
 ; This code checks if the CPU is a 68000 or not
 ;
@@ -1192,6 +1193,7 @@ _not_user_mode:
 _user_mode:
     move.l usp,a0                          ; if user mode, correct stack pointer
     subq.l #6,a0
+    bra.s _notlong                         ; the arguments are on the user stack: no exception frame, no long-frame correction
 ;
 ; This code checks if the CPU is a 68000 or not
 ;
@@ -1306,7 +1308,9 @@ _notlong:
     tst.l d0                             ; Check if the call was successful
     bne.s .Dfree_exit                    ; If not, exit with the error code
     ; Copy here to the DISKINFO structure pointed by a4
-    move.l GEMDRVEMUL_DFREE_STRUCT, a5   ; Address of the structure where the result is stored
+    lea GEMDRVEMUL_DFREE_STRUCT, a5      ; Address of the structure where the result is stored (the
+                                         ; Sidecart writes the 4 longs AT this address; move.l used to
+                                         ; copy from the address held in its first long instead)
     move.l (a5)+, (a4)+                  ; Copy the total number of free clusters
     move.l (a5)+, (a4)+                  ; Copy the number of clusters per drive
     move.l (a5)+, (a4)+                  ; Copy the number of bytes per sector
@@ -1543,13 +1547,17 @@ _notlong:
     move.l 8(a0),a4                      ; get the datetime struct address
     move.w 12(a0),d4                     ; get the handle
     move.w 14(a0),d3                     ; get the flag
+    and.l #$FFFF, d3                     ; Mask the upper word of the flag
+    ext.l d4                             ; Sign-extend the handle: device handles (CON: = -1, ...) stay negative
+
+    ; Fdatime has no path: decide on the handle, like Fread/Fseek/Fclose. This
+    ; used to run detect_emulated_drive_letter on a4, which is the DOSTIME
+    ; pointer here, so the current drive decided instead of the handle.
+    cmp.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_FIRST_FILE_DESCRIPTOR * 4)), d4
+    blt .exec_old_handler                ; Not one of our handles, let TOS handle it
+
     move.l 0(a4), d5                     ; get the datetime information (DOSTIME)
     move.l 4(a4), d6                     ; get the datetime information (DOSDATE)
-    and.l #$FFFF, d3                     ; Mask the upper word of the flag
-    and.l #$FFFF, d4                     ; Mask the upper word of the handle
-
-
-    detect_emulated_drive_letter         ; If not, exec_old_handler the code. Otherwise continue with the code
 
     move.l a4, -(sp)
     ; This is an emulated drive, it's our moment!
@@ -1802,32 +1810,44 @@ _notlong:
     move.w 12(a0),d4                     ; get attribs
 
     cmp.b #':', 1(a4)                    ; Check if the second character of the file specification string is the colon
-    bne .fs_first_check_drive            ; If not, go and check if the drive is the emulated one or not
+    bne.s .fs_first_check_drive          ; If not, go and check if the current drive is an emulated one or not
     move.b (a4), d0                      ; Get the first character of the file specification string
-.fs_first_check_drive_others:
 
     bsr find_drive_slot_by_letter        ; d0 = slot index, or -1 if not one of the emulated drives
     tst.w d0
     bpl.s .fs_first_emulated             ; If found, execute specific fsfirst emulated code
-    bra .exec_old_handler              ; Now it's safe to execute the old handler
-; We need to clean the DTA to avoid issues with previous DTAs used in the emulated code
-;    reentry_gem_lock
-;    gemdos Fgetdta, 2                    ; Call Fgetdta() and get the address of the DTA
-;    move.l d0, -(sp)                     ; Save the return value with the address of the DTA
-;    reentry_gem_unlock
-;    move.l (sp)+, d3                     ; Restore the DTA value
-
-;    move.l _sysbase, a6
-;    move.l 40(a6), a6
-;    move.l 0(a6), d3                     ; Pointer to the BASEPAGE structure of the process
-;    add.l #BASEPAGE_OFFSET_DTA, d3       ; Address of the DTA in the BASEPAGE structure
-
-;    send_sync CMD_DTA_RELEASE_CALL, 4    ; Send the command to the Sidecart. 4 bytes of payload
+    bra.s .fs_first_not_emulated         ; "X:" names a TOS drive -- release the DTA, then hand over to TOS
 
 .fs_first_check_drive:
-    detect_emulated_drive                ; If not, exec_old_handler the code. Otherwise continue with the code
+    ; Same check as the detect_emulated_drive macro, inlined because that
+    ; macro jumps straight to .exec_old_handler on a miss, and a miss here
+    ; must first go through .fs_first_not_emulated below.
+    reentry_gem_lock
+    gemdos Dgetdrv, 2                    ; Call Dgetdrv() and get the current 0-based drive number
+    move.l d0, -(sp)                     ; Save the return value with the drive number
+    reentry_gem_unlock
+    move.l (sp)+, d0                     ; Restore the drive number
+    bsr find_drive_slot_by_number        ; d0 = slot index, or -1 if not one of the emulated drives
+    tst.w d0
+    bpl.s .fs_first_emulated             ; If found, execute specific fsfirst emulated code
 
-;    bra .exec_old_handler                ; Now it's safe to execute the old handler
+; Fsfirst on a TOS drive. The desktop (and many programs) reuse ONE DTA for
+; every search. If that DTA was used for an Fsfirst on an emulated drive
+; before, the RP2040 still has it in its DTA table, so the next Fsnext's
+; CMD_DTA_EXIST_CALL would say "ours" and the RP2040 would answer "no more
+; files" -- cutting TOS's own search off after its first entry (e.g. a hard
+; disk window showing only one file after a TNFS window was opened).
+; Release the DTA TOS is about to fill, so Fsnext bypasses to TOS. The
+; release is a no-op on the RP2040 if the DTA isn't in its table.
+; Use Fgetdta(), not the basepage DTA: that's the DTA Fsfirst/Fsnext use.
+.fs_first_not_emulated:
+    reentry_gem_lock
+    gemdos Fgetdta, 2                    ; Call Fgetdta() and get the address of the DTA
+    move.l d0, -(sp)                     ; Save the return value with the address of the DTA
+    reentry_gem_unlock
+    move.l (sp)+, d3                     ; d3 = DTA address, the CMD_DTA_RELEASE_CALL payload
+    send_sync CMD_DTA_RELEASE_CALL, 4    ; Send the command to the Sidecart. 4 bytes of payload
+    bra .exec_old_handler                ; Now it's safe to execute the old handler
 
 ; CMD_FSFIRST_CALL wire layout (68k -> Pico), 12-byte fixed header + 192-byte
 ; path buffer, byte-for-byte unchanged except for d4's high word:
