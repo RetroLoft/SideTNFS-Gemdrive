@@ -90,6 +90,15 @@ send_sync_command_to_sidecart:
 
     tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
     bne.s .send_sync_command_to_sidecart_use_stack_buffer
+    ; The wait code goes to RAM GEMDRIVE allocated at boot, once it has
+    ; (SHARED_VARIABLE_CODE_BUFFER), and to _dskbufp only before that. Hard
+    ; disk drivers (e.g. ICD) keep data in _dskbufp, so copying our code there
+    ; on every command can corrupt them.
+    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_CODE_BUFFER * 4))
+    beq.s .send_sync_command_to_sidecart_use_dskbuf
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_CODE_BUFFER * 4)), a2
+    bra.s .send_sync_command_to_sidecart_continue
+.send_sync_command_to_sidecart_use_dskbuf:
     move.l _dskbufp, a2                ; Address of the buffer to send the command
     bra.s .send_sync_command_to_sidecart_continue
 .send_sync_command_to_sidecart_use_stack_buffer:
@@ -248,6 +257,15 @@ send_sync_write_command_to_sidecart:
 
     tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
     bne.s .send_sync_write_command_to_sidecart_use_stack_buffer
+    ; The wait code goes to RAM GEMDRIVE allocated at boot, once it has
+    ; (SHARED_VARIABLE_CODE_BUFFER), and to _dskbufp only before that. Hard
+    ; disk drivers (e.g. ICD) keep data in _dskbufp, so copying our code there
+    ; on every command can corrupt them.
+    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_CODE_BUFFER * 4))
+    beq.s .send_sync_write_command_to_sidecart_use_dskbuf
+    move.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_CODE_BUFFER * 4)), a2
+    bra.s .send_sync_write_command_to_sidecart_continue
+.send_sync_write_command_to_sidecart_use_dskbuf:
     move.l _dskbufp, a2                ; Address of the buffer to send the command
     bra.s .send_sync_write_command_to_sidecart_continue
 .send_sync_write_command_to_sidecart_use_stack_buffer:

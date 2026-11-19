@@ -183,6 +183,8 @@ SHARED_VARIABLE_FAKE_FLOPPY             equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZ
 SHARED_VARIABLE_PROTOCOL_VERSION        equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 5             ; Protocol version set by the Pico (must equal GEMDOS_SLOT_PROTOCOL_VERSION)
 SHARED_VARIABLE_DRIVE_COUNT             equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 6             ; Number of active entries in the drive_number table (1..SIDETNFS_MAX_RUNTIME_DRIVES)
 SHARED_VARIABLE_DRIVE_NUMBER_TABLE      equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 7             ; Base index of a SIDETNFS_MAX_RUNTIME_DRIVES-entry table of GEMDOS drive numbers (indexes +7..+15)
+SHARED_VARIABLE_CODE_BUFFER             equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 17            ; RAM for the token wait code, allocated at boot (0 = not yet: use _dskbufp). The Sidecart clears it at CMD_PING and CMD_FLOPPY_SAVE_VECTORS, so an address from before a warm reset is never used
+SHARED_VARIABLE_READ_CHUNK              equ SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE + 16            ; Bytes the last CMD_READ_BUFF_CALL could fill: 16384, less for a distant TNFS server. A shorter reply means end of file
 
 GEMDRVEMUL_TIMEOUT_SEC  equ (ROM_EXCHG_BUFFER_ADDR + $8)     ; ROM_EXCHG_BUFFER_ADDR + 8 bytes
 GEMDRVEMUL_PING_STATUS  equ (GEMDRVEMUL_TIMEOUT_SEC + $4)    ; GEMDRVEMUL_TIMEOUT_SEC + 4 bytes
@@ -244,6 +246,7 @@ VEC_GEMDOS              equ $21                             ; Trap #1 GEMDOS vec
 XBIOS_TRAP_ADDR         equ $b8                             ; TRAP #14 Handler (XBIOS)
 DSKBUFP_TMP_ADDR        equ $100                            ; Address of the temporary registry buffer to store the DSKBUF pointer
 DSKBUFP_SWAP_ADDR       equ $200                            ; Address of the temporary swap buffer to store the DSKBUF pointer
+CODE_BUFFER_SIZE        equ 128                             ; Bytes of RAM for the token wait code (checked at the end of this file)
 MEGASTE_SPEED_CACHE_REG equ $FFFF8E21                       ; Address of the registry to change speed and cache in the MegaSTE
 USE_DSKBUF              equ 0                               ; Use the DSKBUF pointer to store the address of the buffer to read the data from the Sidecart. 0 = Stack, 1 = disk buffer
 
@@ -308,6 +311,18 @@ reentry_gem_unlock  macro
                     moveq.w #0,d1                        ; Payload size is 0 bytes
                     bsr send_sync_command_to_sidecart
                 	endm
+;  Z clear (bne taken) when the temporary data of a file call (saved
+; registers, the PRG header of Pexec) goes on the stack, Z set when it goes
+; in _dskbufp. On the stack with the stack buffer type, and also as soon as
+; our own code buffer exists: then nothing of ours touches _dskbufp any
+; more, which disk drivers (e.g. ICD) use for their own data.
+tst_temp_on_stack   macro
+                    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
+                    bne.s .\@tst_temp_on_stack_done
+                    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_CODE_BUFFER * 4))
+.\@tst_temp_on_stack_done:
+                    endm
+
 ; Check if the current GEMDOS drive is one of the emulated drives. If not,
 ; exec_old_handler the code, otherwise continue with the code.
 ; Output: d0.w = slot index (0..SIDETNFS_MAX_RUNTIME_DRIVES-1) of the matched drive in
@@ -423,6 +438,19 @@ rom_function:
 _ping_ready:
     print ok_msg
     print ready_gemdrive_msg
+
+; From here on the token wait code runs from a piece of RAM of our own, not
+; from _dskbufp: hard disk drivers (e.g. ICD) keep data there, and every
+; file call of every drive passes through this code. Without the memory
+; everything keeps working as before, from _dskbufp.
+    move.l #CODE_BUFFER_SIZE, -(sp)
+    gemdos Malloc, 6
+    tst.l d0
+    ble.s .code_buffer_done
+    move.l d0, d4                        ; d4 = address of the buffer
+    move.l #SHARED_VARIABLE_CODE_BUFFER, d3
+    send_sync CMD_SET_SHARED_VAR, 8      ; Still runs from _dskbufp; the next command uses the buffer
+.code_buffer_done:
 
 ; Clean GEM reentry lock on start
 ; This is necessary in case there was a crash during a reentry call
@@ -1593,7 +1621,7 @@ _notlong:
     move.l d4, d5                        ; Save the number of bytes to read in d5
     clr.l  d6                            ; d6 is the bytes read counter
 .fread_loop:
-    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
+    tst_temp_on_stack                    ; stack or _dskbufp for the temporary data, see the macro
     bne.s .fread_loop_use_stack_buffer
     move.l _dskbufp, a5               ; Address of the buffer to read the data from the Sidecart
     movem.l d3-d7, DSKBUFP_TMP_ADDR(a5) ; Save the registers
@@ -1696,8 +1724,11 @@ _notlong:
 
 .fread_copy_exit:
     add.l d0, d6                         ; Add the number of bytes read to the counter
-    cmp.l #BUFFER_READ_SIZE, d0          ; Check if the number of bytes read is not equal than the buffer size
-    bne.s .fread_exit_ok                 ; if not equal, it's smaller than the buffer size. We are done
+    ; The Sidecart fills at most SHARED_VARIABLE_READ_CHUNK bytes per call:
+    ; the whole buffer (BUFFER_READ_SIZE), or less for a distant TNFS server,
+    ; whose READ rounds would not all fit in our token timeout otherwise.
+    cmp.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_READ_CHUNK * 4)), d0
+    bne.s .fread_exit_ok                 ; if not equal, it's smaller than a full chunk. We are done
 
     sub.l d0, d5                         ; Subtract the number of bytes read from the total number of bytes to read
     bpl .fread_loop                    ; If there are more bytes to read, continue
@@ -1731,7 +1762,7 @@ _notlong:
     moveq.l #GEMDOS_EINTRN, d0           ; Error code. GEMDOS_EINTRN is the error code for the internal error
     bra .fwrite_exit                   ; Exit the loop
 .fwrite_loop_retry_start:                ; Start the loop to retry to send the data
-    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
+    tst_temp_on_stack                    ; stack or _dskbufp for the temporary data, see the macro
     bne.s .fwrite_loop_use_stack_buffer
     move.l _dskbufp, a5                    ; Address of the buffer to read the data from the Sidecart
     movem.l d3-d7/a4, DSKBUFP_TMP_ADDR(a5) ; Save the registers
@@ -1764,7 +1795,7 @@ _notlong:
 
 .fwrite_check_crc_exit:
     add.l d2, a4
-    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
+    tst_temp_on_stack                    ; stack or _dskbufp for the temporary data, see the macro
     bne.s .fwrite_check_use_stack_buffer
     move.l _dskbufp, a5                    ; Address of the buffer to read the data from the Sidecart
     movem.l d3-d7/a4, DSKBUFP_TMP_ADDR(a5) ; Save the registers
@@ -1986,7 +2017,7 @@ _notlong:
 ;        move.l (sp)+, a4                     ; Restore the address of the buffer to read
 ;    endif
 
-    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
+    tst_temp_on_stack                    ; stack or _dskbufp for the temporary data, see the macro
     bne.s .pexec_load_header_use_stack_buffer
     move.l _dskbufp, a4                  ; Address of the buffer to read the data from the Sidecart
     lea DSKBUFP_SWAP_ADDR(a4), a4        ; This is the swap area
@@ -2016,7 +2047,7 @@ _notlong:
 ;        add.l #PRG_STRUCT_SIZE,sp            ; restore the stack pointer
 ;    endif
 
-    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
+    tst_temp_on_stack                    ; stack or _dskbufp for the temporary data, see the macro
     beq.s .pexec_load_header_not_restore_stack
     add.l #PRG_STRUCT_SIZE,sp            ; restore the stack pointer
 
@@ -2207,7 +2238,7 @@ _notlong:
 ;        add.l #PRG_STRUCT_SIZE,sp            ; restore the stack pointer
 ;    endif
 
-    tst.l (GEMDRVEMUL_SHARED_VARIABLES + (SHARED_VARIABLE_BUFFER_TYPE * 4))
+    tst_temp_on_stack                    ; stack or _dskbufp for the temporary data, see the macro
     beq.s .pexec_close_exit_fix_hdr_buf_not_restore_stack
     add.l #PRG_STRUCT_SIZE,sp            ; restore the stack pointer
 
@@ -2332,3 +2363,12 @@ null_pointer:
 
         even
 rom_function_end:
+
+; The token wait code is copied into our CODE_BUFFER_SIZE bytes of RAM: make
+; sure both variants still fit.
+    ifgt (_end_sync_code_in_stack-_start_sync_code_in_stack)-CODE_BUFFER_SIZE
+    fail "the sync wait code no longer fits in CODE_BUFFER_SIZE"
+    endif
+    ifgt (_end_sync_write_code_in_stack-_start_sync_write_code_in_stack)-CODE_BUFFER_SIZE
+    fail "the sync write wait code no longer fits in CODE_BUFFER_SIZE"
+    endif
