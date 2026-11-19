@@ -344,6 +344,20 @@ detect_emulated_drive   macro
 ; string in a4.
 ; Output: d0.w = slot index (0..SIDETNFS_MAX_RUNTIME_DRIVES-1) of the matched drive.
 detect_emulated_drive_letter   macro
+                        ; A device name (CON:, AUX:, PRN:, ...) is for TOS. Without this
+                        ; check it has no "X:" prefix, so the current drive decided, and on
+                        ; an emulated drive Fopen("CON:") went to the cartridge as a file
+                        ; name (-33). A colon can't be part of an 8.3 name, and "C:\..." has
+                        ; its colon at offset 1, so ordinary paths are not affected.
+                        tst.b (a4)
+                        beq.s .\@detect_emulated_not_device
+                        tst.b 1(a4)
+                        beq.s .\@detect_emulated_not_device
+                        tst.b 2(a4)
+                        beq.s .\@detect_emulated_not_device
+                        cmp.b #':', 3(a4)
+                        beq .exec_old_handler
+.\@detect_emulated_not_device:
                         cmp.b #':', 1(a4)                    ; Check if the second character of the file specification string is the colon
                         bne.s .\@detect_emulated_drive_continue; If not, exec_old_handler the code. Otherwise continue with the code
                         move.b (a4), d0                      ; Get the first letter of the file specification string
